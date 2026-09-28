@@ -51,7 +51,11 @@ import java.util.concurrent.TimeoutException;
 class IdmapDaemon {
     // The amount of time in milliseconds to wait after a transaction to the idmap service is made
     // before stopping the service.
-    private static final int SERVICE_TIMEOUT_MS = 10000;
+    // On slow eMMC devices first-boot idmap creation for ~48 overlays
+    // takes far longer than 10s and the daemon gets idle-killed before any
+    // transaction completes, so idmaps never persist and every boot loops.
+    // Give it 120s; warmed caches make later boots fast again.
+    private static final int SERVICE_TIMEOUT_MS = 120000;
 
     // The device may enter CPU sleep while waiting for the service startup, and in that mode
     // the uptime doesn't increment. Thus, we need to have two timeouts: a smaller one for the
