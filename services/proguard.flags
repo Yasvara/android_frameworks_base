@@ -148,3 +148,13 @@
 -keep,allowoptimization,allowaccessmodification class lineageos.** { *; }
 -keep,allowoptimization,allowaccessmodification class org.lineageos.** { *; }
 -keep,allowoptimization,allowaccessmodification class vendor.lineage.** { *; }
+
+# org.lineageos.platform is loaded into system_server as a separate jar and
+# links against these classes, which R8 cannot trace when optimizing.
+-keep class com.android.server.LocalServices { *; }
+-keep class com.android.server.ServiceThread { *; }
+-keep class com.android.server.SystemService { *; }
+-keep class com.android.server.SystemService$* { *; }
+-keep class com.android.server.SystemServiceManager { *; }
+-keep class com.android.server.accessibility.DisplayAdjustmentUtils { *; }
+-keep class com.android.server.display.color.DisplayTransformManager { *; }
