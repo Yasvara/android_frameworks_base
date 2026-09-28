@@ -1561,6 +1561,16 @@ bool BootAnimation::playAnimation(const Animation& animation) {
                         (static_cast<float>(frameIdxInPart) - colorTransitionStart) /
                             fmax(colorTransitionEnd - colorTransitionStart, 1.0f), 0.0f), 1.0f)
                     : (part.postDynamicColoring ? 1 : 0);
+                if (animation.dynamicColoringEnabled) {
+                    // Frames can be smaller than the display. Fill the area
+                    // around them with the dynamic background colour (mask
+                    // channel R) so it follows the system theme as well.
+                    const float* from = animation.startColors[0];
+                    const float* to = animation.endColors[0];
+                    glClearColor(from[0] + (to[0] - from[0]) * colorProgress,
+                                 from[1] + (to[1] - from[1]) * colorProgress,
+                                 from[2] + (to[2] - from[2]) * colorProgress, 1.0f);
+                }
                 processDisplayEvents();
 
                 const Animation::Frame& frame(part.frames[frameIdxInPart]);
