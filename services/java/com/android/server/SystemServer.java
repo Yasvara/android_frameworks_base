@@ -1982,6 +1982,10 @@ public final class SystemServer implements Dumpable {
         mSystemServiceManager.startService(UiModeManagerService.class);
         t.traceEnd();
 
+        t.traceBegin("StartBootAnimationColorService");
+        mSystemServiceManager.startService(BootAnimationColorService.class);
+        t.traceEnd();
+
         t.traceBegin("StartLocaleManagerService");
         try {
             mSystemServiceManager.startService(LocaleManagerService.class);
