@@ -3462,26 +3462,6 @@ public final class SystemServer implements Dumpable {
             t.traceEnd();
         }
 
-        // Lineage Services
-        String externalServer = context.getResources().getString(
-                org.lineageos.platform.internal.R.string.config_externalSystemServer);
-        final Class<?> serverClazz;
-        try {
-            serverClazz = Class.forName(externalServer);
-            final Constructor<?> constructor = serverClazz.getDeclaredConstructor(Context.class);
-            constructor.setAccessible(true);
-            final Object baseObject = constructor.newInstance(mSystemContext);
-            final Method method = baseObject.getClass().getDeclaredMethod("run");
-            method.setAccessible(true);
-            method.invoke(baseObject);
-        } catch (ClassNotFoundException
-                | IllegalAccessException
-                | InvocationTargetException
-                | InstantiationException
-                | NoSuchMethodException e) {
-            reportWtf("Making " + externalServer + " ready", e);
-        }
-
         // It is now time to start up the app processes...
 
         t.traceBegin("MakeLockSettingsServiceReady");

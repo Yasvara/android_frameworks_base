@@ -116,7 +116,8 @@ import com.android.systemui.util.LargeScreenUtils;
 import com.android.systemui.util.kotlin.JavaAdapter;
 import com.android.systemui.utils.windowmanager.WindowManagerProvider;
 
-import lineageos.providers.LineageSettings;
+import android.provider.Settings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import dalvik.annotation.optimization.NeverCompile;
 
@@ -427,9 +428,9 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         mOneFingerQuickSettingsInterceptObserver = new ContentObserver(null) {
             @Override
             public void onChange(boolean selfChange) {
-                mOneFingerQuickSettingsIntercept = LineageSettings.System.getIntForUser(
+                mOneFingerQuickSettingsIntercept = Settings.System.getIntForUser(
                         mPanelView.getContext().getContentResolver(),
-                        LineageSettings.System.STATUS_BAR_QUICK_QS_PULLDOWN, 0,
+                        YasvaraSettings.System.STATUS_BAR_QUICK_QS_PULLDOWN, 0,
                         selectedUserInteractor.getSelectedUserId());
             }
         };
@@ -2328,8 +2329,8 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
             mNotificationStackScrollLayoutController.setQsHeaderBoundsProvider(provider);
             mQs.setScrollListener(mQsScrollListener);
             mPanelView.getContext().getContentResolver().registerContentObserver(
-                    LineageSettings.System.getUriFor(
-                            LineageSettings.System.STATUS_BAR_QUICK_QS_PULLDOWN),
+                    Settings.System.getUriFor(
+                            YasvaraSettings.System.STATUS_BAR_QUICK_QS_PULLDOWN),
                     false, mOneFingerQuickSettingsInterceptObserver,
                     UserHandle.USER_ALL);
             mOneFingerQuickSettingsInterceptObserver.onChange(true);

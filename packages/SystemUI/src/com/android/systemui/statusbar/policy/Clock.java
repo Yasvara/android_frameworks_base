@@ -58,7 +58,8 @@ import com.android.systemui.statusbar.phone.ui.StatusBarIconController;
 import com.android.systemui.tuner.TunerService;
 import com.android.systemui.tuner.TunerService.Tunable;
 
-import lineageos.providers.LineageSettings;
+import android.provider.Settings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -208,7 +209,7 @@ public class Clock extends TextView implements
             Dependency.get(TunerService.class).addTunable(this, CLOCK_SECONDS,
                     StatusBarIconController.ICON_HIDE_LIST);
             mContext.getContentResolver().registerContentObserver(
-                    LineageSettings.System.getUriFor(LineageSettings.System.STATUS_BAR_AM_PM),
+                    Settings.System.getUriFor(YasvaraSettings.System.STATUS_BAR_AM_PM),
                     false, mContentObserver);
             mUserTracker.addCallback(mUserChangedCallback, mContext.getMainExecutor());
             mCurrentUserId = mUserTracker.getUserId();
@@ -360,8 +361,8 @@ public class Clock extends TextView implements
     }
 
     private int readClockAmPm(Context context) {
-        return LineageSettings.System.getIntForUser(
-                context.getContentResolver(), LineageSettings.System.STATUS_BAR_AM_PM,
+        return Settings.System.getIntForUser(
+                context.getContentResolver(), YasvaraSettings.System.STATUS_BAR_AM_PM,
                 AM_PM_STYLE_GONE, UserHandle.USER_CURRENT);
     }
 

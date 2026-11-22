@@ -36,7 +36,8 @@ import com.android.systemui.statusbar.policy.DevicePostureController;
 import com.android.systemui.user.domain.interactor.SelectedUserInteractor;
 import com.android.systemui.util.wrapper.LockPatternCheckerWrapper;
 
-import lineageos.providers.LineageSettings;
+import android.provider.Settings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import java.time.Duration;
 import java.util.Optional;
@@ -109,8 +110,8 @@ public class KeyguardPinViewController
         mPasswordEntry.setUsePinShapes(true);
         updateAutoConfirmationState();
         mView.updatePinScrambling(
-                LineageSettings.System.getIntForUser(getContext().getContentResolver(),
-                        LineageSettings.System.LOCKSCREEN_PIN_SCRAMBLE_LAYOUT, 0,
+                Settings.System.getIntForUser(getContext().getContentResolver(),
+                        YasvaraSettings.System.LOCKSCREEN_PIN_SCRAMBLE_LAYOUT, 0,
                         mSelectedUserInteractor.getSelectedUserId()) == 1);
     }
 
@@ -136,8 +137,8 @@ public class KeyguardPinViewController
     public void startAppearAnimation() {
         super.startAppearAnimation();
         mView.updatePinScrambling(
-                LineageSettings.System.getIntForUser(getContext().getContentResolver(),
-                        LineageSettings.System.LOCKSCREEN_PIN_SCRAMBLE_LAYOUT, 0,
+                Settings.System.getIntForUser(getContext().getContentResolver(),
+                        YasvaraSettings.System.LOCKSCREEN_PIN_SCRAMBLE_LAYOUT, 0,
                         mSelectedUserInteractor.getSelectedUserId()) == 1);
     }
 

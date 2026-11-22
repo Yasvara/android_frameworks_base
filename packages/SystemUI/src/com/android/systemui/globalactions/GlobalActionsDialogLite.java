@@ -180,10 +180,8 @@ import dagger.assisted.Assisted;
 import dagger.assisted.AssistedFactory;
 import dagger.assisted.AssistedInject;
 
-import lineageos.app.LineageGlobalActions;
-import lineageos.providers.LineageSettings;
+import com.android.internal.yasvara.YasvaraSettings;
 
-import org.lineageos.internal.util.PowerMenuUtils;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -305,8 +303,6 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
     private final EmergencyAffordanceManager mEmergencyAffordanceManager;
     @NonNull
     private final ScreenshotHelper mScreenshotHelper;
-    @NonNull
-    private final LineageGlobalActions mLineageGlobalActions;
 
     // Used for RingerModeTracker
     private final LifecycleRegistry mLifecycle = new LifecycleRegistry(this);
@@ -574,10 +570,9 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
 
         mEmergencyAffordanceManager = emergencyAffordanceManager;
         mScreenshotHelper = screenshotHelper;
-        mLineageGlobalActions = LineageGlobalActions.getInstance(mContext);
         mActions = loadPowerMenuActions();
         mContext.getContentResolver().registerContentObserver(
-                LineageSettings.Secure.getUriFor(LineageSettings.Secure.POWER_MENU_ACTIONS),
+                Settings.Secure.getUriFor(YasvaraSettings.Secure.POWER_MENU_ACTIONS),
                 false, mPowerMenuActionsObserver);
 
         mConfigurationController.addCallback(this);
@@ -599,15 +594,6 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
     }
 
     private String[] loadPowerMenuActions() {
-        try {
-            String[] actions = mLineageGlobalActions.getUserActionsArray();
-            if (actions != null) {
-                return actions;
-            }
-        } catch (RuntimeException e) {
-            Log.w(TAG, "Unable to load Lineage power menu actions", e);
-        }
-
         List<GlobalActionType> defaultActions = mInteractor.getPossibleGlobalActions();
         String[] actions = new String[defaultActions.size()];
         for (int i = 0; i < defaultActions.size(); i++) {
@@ -740,13 +726,17 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
     }
 
     private boolean shouldShowRestartSubmenu() {
-        return PowerMenuUtils.isAdvancedRestartPossible(mContext);
+        final android.app.KeyguardManager km = mContext.getSystemService(android.app.KeyguardManager.class);
+        final boolean keyguardLocked = km != null && km.isKeyguardLocked();
+        final boolean enabled = Settings.Secure.getInt(mContext.getContentResolver(),
+                YasvaraSettings.Secure.ADVANCED_REBOOT, 0) == 1;
+        return enabled && !keyguardLocked && android.os.UserHandle.getCallingUserId() == android.os.UserHandle.USER_SYSTEM;
     }
 
     @VisibleForTesting
     String[] getRestartActions() {
         return mResources.getStringArray(
-                org.lineageos.platform.internal.R.array.config_restartActionsList);
+                com.android.internal.R.array.config_restartActionsList);
     }
 
     @VisibleForTesting

@@ -25,21 +25,38 @@ import android.content.pm.PackageManager;
 import android.hardware.IConsumerIrService;
 import android.hardware.ir.ConsumerIrFreqRange;
 import android.hardware.ir.IConsumerIr;
+import android.os.Binder;
+import android.os.DeadObjectException;
+import android.os.Handler;
 import android.os.PowerManager;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.util.Slog;
 
+import com.android.internal.os.BackgroundThread;
+
 public class ConsumerIrService extends IConsumerIrService.Stub {
     private static final String TAG = "ConsumerIrService";
+    private static final String FQ_NAME = IConsumerIr.DESCRIPTOR + "/default";
 
     private static final int MAX_XMIT_TIME = 2000000; /* in microseconds */
+    private static final long IDLE_RELEASE_MS = 10_000L;
 
     private final Context mContext;
     private final PowerManager.WakeLock mWakeLock;
     private final boolean mHasNativeHal;
     private final Object mHalLock = new Object();
+    private final Handler mHandler = BackgroundThread.getHandler();
     private IConsumerIr mAidlService = null;
+
+    private final Runnable mReleaseHal = () -> {
+        synchronized (mHalLock) {
+            if (mAidlService != null) {
+                mAidlService = null;
+                Binder.flushPendingCommands();
+            }
+        }
+    };
 
     ConsumerIrService(Context context) {
         mContext = context;
@@ -48,14 +65,15 @@ public class ConsumerIrService extends IConsumerIrService.Stub {
         mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
         mWakeLock.setReferenceCounted(true);
 
-        mHasNativeHal = getHalService();
+        // Query VINTF declaration without starting a lazy HAL at boot.
+        mHasNativeHal = ServiceManager.isDeclared(FQ_NAME);
 
         if (mContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CONSUMER_IR)) {
             if (!mHasNativeHal) {
-                throw new RuntimeException("FEATURE_CONSUMER_IR present, but no IR HAL loaded!");
+                throw new RuntimeException("FEATURE_CONSUMER_IR present, but no IR HAL declared!");
             }
         } else if (mHasNativeHal) {
-            throw new RuntimeException("IR HAL present, but FEATURE_CONSUMER_IR is not set!");
+            throw new RuntimeException("IR HAL declared, but FEATURE_CONSUMER_IR is not set!");
         }
     }
 
@@ -65,12 +83,18 @@ public class ConsumerIrService extends IConsumerIrService.Stub {
         return mHasNativeHal;
     }
 
-    private boolean getHalService() {
-        // Attempt to get the AIDL HAL service first
-        final String fqName = IConsumerIr.DESCRIPTOR + "/default";
+    private IConsumerIr getHalServiceLocked() {
+        if (mAidlService != null && mAidlService.asBinder().isBinderAlive()) {
+            return mAidlService;
+        }
         mAidlService = IConsumerIr.Stub.asInterface(
-                        ServiceManager.waitForDeclaredService(fqName));
-        return mAidlService != null;
+                ServiceManager.waitForDeclaredService(FQ_NAME));
+        return mAidlService;
+    }
+
+    private void scheduleReleaseLocked() {
+        mHandler.removeCallbacks(mReleaseHal);
+        mHandler.postDelayed(mReleaseHal, IDLE_RELEASE_MS);
     }
 
     private void throwIfNoIrEmitter() {
@@ -102,11 +126,22 @@ public class ConsumerIrService extends IConsumerIrService.Stub {
 
         // Right now there is no mechanism to ensure fair queing of IR requests
         synchronized (mHalLock) {
-            if (mAidlService != null) {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                IConsumerIr hal = getHalServiceLocked();
+                if (hal == null) {
+                    Slog.e(TAG, "IR HAL unavailable for transmit");
+                    return;
+                }
                 try {
-                    mAidlService.transmit(carrierFrequency, pattern);
+                    hal.transmit(carrierFrequency, pattern);
+                    scheduleReleaseLocked();
+                    return;
+                } catch (DeadObjectException e) {
+                    mAidlService = null;
                 } catch (RemoteException ignore) {
+                    mAidlService = null;
                     Slog.e(TAG, "Error transmitting frequency: " + carrierFrequency);
+                    return;
                 }
             }
         }
@@ -119,10 +154,15 @@ public class ConsumerIrService extends IConsumerIrService.Stub {
 
         throwIfNoIrEmitter();
 
-        synchronized(mHalLock) {
-            if (mAidlService != null) {
+        synchronized (mHalLock) {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                IConsumerIr hal = getHalServiceLocked();
+                if (hal == null) {
+                    return null;
+                }
                 try {
-                    ConsumerIrFreqRange[] output = mAidlService.getCarrierFreqs();
+                    ConsumerIrFreqRange[] output = hal.getCarrierFreqs();
+                    scheduleReleaseLocked();
                     if (output.length <= 0) {
                         Slog.e(TAG, "Error getting carrier frequencies.");
                     }
@@ -132,7 +172,10 @@ public class ConsumerIrService extends IConsumerIrService.Stub {
                         result[i * 2 + 1] = output[i].maxHz;
                     }
                     return result;
+                } catch (DeadObjectException e) {
+                    mAidlService = null;
                 } catch (RemoteException ignore) {
+                    mAidlService = null;
                     return null;
                 }
             }

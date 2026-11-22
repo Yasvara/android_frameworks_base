@@ -117,7 +117,7 @@ import com.android.server.lights.LightsManager;
 import com.android.server.lights.LogicalLight;
 import com.android.server.policy.WindowManagerPolicy;
 
-import lineageos.providers.LineageSettings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import java.io.PrintWriter;
 import java.util.concurrent.CountDownLatch;
@@ -1032,7 +1032,7 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 Settings.System.getUriFor(Settings.System.SCREEN_BRIGHTNESS_FOR_ALS),
                 /* notifyForDescendants= */ false, mSettingsObserver, UserHandle.USER_ALL);
         mContext.getContentResolver().registerContentObserver(
-                LineageSettings.System.getUriFor(LineageSettings.System.AUTO_BRIGHTNESS_ONE_SHOT),
+                Settings.System.getUriFor(YasvaraSettings.System.AUTO_BRIGHTNESS_ONE_SHOT),
                 false /*notifyForDescendants*/, mSettingsObserver, UserHandle.USER_ALL);
         handleBrightnessModeChange();
     }
@@ -2536,8 +2536,8 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
     }
 
     private boolean getAutoBrightnessOneShotSetting() {
-        return LineageSettings.System.getIntForUser(
-                mContext.getContentResolver(), LineageSettings.System.AUTO_BRIGHTNESS_ONE_SHOT,
+        return Settings.System.getIntForUser(
+                mContext.getContentResolver(), YasvaraSettings.System.AUTO_BRIGHTNESS_ONE_SHOT,
                 0, UserHandle.USER_CURRENT) == 1;
     }
 

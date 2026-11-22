@@ -60,6 +60,7 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 
@@ -85,8 +86,12 @@ public class BoostFramework {
 // QTI_BEGIN: 2024-10-24: Performance: Added perf hint release support am: 9f4fce0d31
     public static final int VENDOR_V_API_LEVEL = 202404;
 // QTI_END: 2024-10-24: Performance: Added perf hint release support am: 9f4fce0d31
-    public final int board_first_api_lvl = SystemProperties.getInt("ro.board.first_api_level", 0);
-    public final int board_api_lvl = SystemProperties.getInt("ro.board.api_level", 0);
+    private static final int sBoardFirstApiLvl =
+            SystemProperties.getInt("ro.board.first_api_level", 0);
+    private static final int sBoardApiLvl =
+            SystemProperties.getInt("ro.board.api_level", 0);
+    public final int board_first_api_lvl = sBoardFirstApiLvl;
+    public final int board_api_lvl = sBoardApiLvl;
     //key in privider settings global
     public static final String KEY_LEGACY_UI_PERF_PKGS = "LEGACY_UI_PERF_PROCS";
     public static final String KEY_GPU_PREFER = "UI_PERF_GPU_PREFER";
@@ -107,7 +112,7 @@ public class BoostFramework {
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
 /** @hide */
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-    private static boolean sIsLoaded = false;
+    private static volatile boolean sIsLoaded = false;
     private static Class<?> sPerfClass = null;
     private static Method sAcquireFunc = null;
     private static Method sPerfHintFunc = null;
@@ -356,128 +361,132 @@ public class BoostFramework {
     }
 
     private void initFunctions () {
+        if (sIsLoaded) return;
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
         synchronized(BoostFramework.class) {
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-            if (sIsLoaded == false) {
+            if (!sIsLoaded) {
+                if (new File(PERFORMANCE_JAR).exists()) {
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                try {
+                    try {
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    sPerfClass = Class.forName(PERFORMANCE_CLASS);
-// QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-
-                    Class[] argClasses = new Class[] {int.class, int[].class};
-// QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    sAcquireFunc = sPerfClass.getMethod("perfLockAcquire", argClasses);
+                        sPerfClass = Class.forName(PERFORMANCE_CLASS);
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
 
-                    argClasses = new Class[] {int.class, String.class, int.class, int.class};
+                        Class[] argClasses = new Class[] {int.class, int[].class};
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    sPerfHintFunc = sPerfClass.getMethod("perfHint", argClasses);
+                        sAcquireFunc = sPerfClass.getMethod("perfLockAcquire", argClasses);
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
 
-                    argClasses = new Class[] {};
+                        argClasses = new Class[] {int.class, String.class, int.class, int.class};
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    sReleaseFunc = sPerfClass.getMethod("perfLockRelease", argClasses);
+                        sPerfHintFunc = sPerfClass.getMethod("perfHint", argClasses);
+// QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
+
+                        argClasses = new Class[] {};
+// QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
+                        sReleaseFunc = sPerfClass.getMethod("perfLockRelease", argClasses);
 
 // QTI_BEGIN: 2024-10-24: Performance: Added perf hint release support am: 9f4fce0d31
-                    argClasses = new Class[] {};
-                    sPerfHintRelFunc = sPerfClass.getMethod("perfHintRelease", argClasses);
+                        argClasses = new Class[] {};
+                        sPerfHintRelFunc = sPerfClass.getMethod("perfHintRelease", argClasses);
 
 // QTI_END: 2024-10-24: Performance: Added perf hint release support am: 9f4fce0d31
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    argClasses = new Class[] {int.class};
+                        argClasses = new Class[] {int.class};
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
-                    sReleaseHandlerFunc = sPerfClass.getDeclaredMethod("perfLockReleaseHandler", argClasses);
+                        sReleaseHandlerFunc = sPerfClass.getDeclaredMethod("perfLockReleaseHandler", argClasses);
 
-                    argClasses = new Class[] {int.class, String.class};
-                    sFeedbackFunc = sPerfClass.getMethod("perfGetFeedback", argClasses);
+                        argClasses = new Class[] {int.class, String.class};
+                        sFeedbackFunc = sPerfClass.getMethod("perfGetFeedback", argClasses);
 
-                    argClasses = new Class[] {int.class, String.class, int.class, int[].class};
-                    sFeedbackFuncExtn = sPerfClass.getMethod("perfGetFeedbackExtn", argClasses);
+                        argClasses = new Class[] {int.class, String.class, int.class, int[].class};
+                        sFeedbackFuncExtn = sPerfClass.getMethod("perfGetFeedbackExtn", argClasses);
 
 // QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-                    argClasses = new Class[] {int.class, String.class, String.class};
-                    sIOPStart =   sPerfClass.getDeclaredMethod("perfIOPrefetchStart", argClasses);
+                        argClasses = new Class[] {int.class, String.class, String.class};
+                        sIOPStart =   sPerfClass.getDeclaredMethod("perfIOPrefetchStart", argClasses);
 
-                    argClasses = new Class[] {};
-                    sIOPStop =  sPerfClass.getDeclaredMethod("perfIOPrefetchStop", argClasses);
-
-// QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-                    argClasses = new Class[] {String.class, String.class};
-                    sPerfGetPropFunc = sPerfClass.getMethod("perfGetProp", argClasses);
-
-                    argClasses = new Class[] {int.class, int.class, int.class, int.class, int[].class};
-                    sAcqAndReleaseFunc = sPerfClass.getMethod("perfLockAcqAndRelease", argClasses);
-
-                    argClasses = new Class[] {int.class, String.class, int.class, int[].class};
-                    sPerfEventFunc = sPerfClass.getMethod("perfEvent", argClasses);
-
-                    argClasses = new Class[] {int.class};
-                    sPerfSyncRequest = sPerfClass.getMethod("perfSyncRequest", argClasses);
-
-                    argClasses = new Class[] {int.class, int.class, String.class, int.class,
-                                              int.class, int.class, int[].class};
-                    sperfHintAcqRelFunc = sPerfClass.getMethod("perfHintAcqRel", argClasses);
-
-                    argClasses = new Class[] {int.class, int.class, String.class, int.class,
-                                              int.class, int.class, int[].class};
-                    sperfHintRenewFunc = sPerfClass.getMethod("perfHintRenew", argClasses);
-
-                    try {
                         argClasses = new Class[] {};
-                        sPerfGetPerfHalVerFunc = sPerfClass.getMethod("perfGetHalVer", argClasses);
+                        sIOPStop =  sPerfClass.getDeclaredMethod("perfIOPrefetchStop", argClasses);
 
-                    } catch (Exception e) {
-                        Log.i(TAG, "BoostFramework() : Exception_1 = perfGetHalVer not supported");
-                        sPerfGetPerfHalVerFunc = null;
-                    }
-
-// QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-                    try {
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-// QTI_BEGIN: 2019-05-30: Core: Perf: Change for AGPE
-                        argClasses = new Class[] {int.class, int.class, String.class, int.class, String.class};
-// QTI_END: 2019-05-30: Core: Perf: Change for AGPE
-// QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-                        sUXEngineEvents =  sPerfClass.getDeclaredMethod("perfUXEngine_events",
-                                                                          argClasses);
+                        argClasses = new Class[] {String.class, String.class};
+                        sPerfGetPropFunc = sPerfClass.getMethod("perfGetProp", argClasses);
+
+                        argClasses = new Class[] {int.class, int.class, int.class, int.class, int[].class};
+                        sAcqAndReleaseFunc = sPerfClass.getMethod("perfLockAcqAndRelease", argClasses);
+
+                        argClasses = new Class[] {int.class, String.class, int.class, int[].class};
+                        sPerfEventFunc = sPerfClass.getMethod("perfEvent", argClasses);
 
                         argClasses = new Class[] {int.class};
-                        sUXEngineTrigger =  sPerfClass.getDeclaredMethod("perfUXEngine_trigger",
-                                                                           argClasses);
-                    } catch (Exception e) {
-                        Log.i(TAG, "BoostFramework() : Exception_4 = PreferredApps not supported");
-                    }
+                        sPerfSyncRequest = sPerfClass.getMethod("perfSyncRequest", argClasses);
+
+                        argClasses = new Class[] {int.class, int.class, String.class, int.class,
+                                                  int.class, int.class, int[].class};
+                        sperfHintAcqRelFunc = sPerfClass.getMethod("perfHintAcqRel", argClasses);
+
+                        argClasses = new Class[] {int.class, int.class, String.class, int.class,
+                                                  int.class, int.class, int[].class};
+                        sperfHintRenewFunc = sPerfClass.getMethod("perfHintRenew", argClasses);
+
+                        try {
+                            argClasses = new Class[] {};
+                            sPerfGetPerfHalVerFunc = sPerfClass.getMethod("perfGetHalVer", argClasses);
+
+                        } catch (Exception e) {
+                            Log.i(TAG, "BoostFramework() : Exception_1 = perfGetHalVer not supported");
+                            sPerfGetPerfHalVerFunc = null;
+                        }
+
+// QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
+                        try {
+// QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
+// QTI_BEGIN: 2019-05-30: Core: Perf: Change for AGPE
+                            argClasses = new Class[] {int.class, int.class, String.class, int.class, String.class};
+// QTI_END: 2019-05-30: Core: Perf: Change for AGPE
+// QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
+                            sUXEngineEvents =  sPerfClass.getDeclaredMethod("perfUXEngine_events",
+                                                                              argClasses);
+
+                            argClasses = new Class[] {int.class};
+                            sUXEngineTrigger =  sPerfClass.getDeclaredMethod("perfUXEngine_trigger",
+                                                                               argClasses);
+                        } catch (Exception e) {
+                            Log.i(TAG, "BoostFramework() : Exception_4 = PreferredApps not supported");
+                        }
 
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
-                    sIsLoaded = true;
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
+                    }
+                    catch(Exception e) {
+                        Log.d(TAG,"BoostFramework() : Exception_1 = " + e);
+                    }
                 }
-                catch(Exception e) {
-                    Log.d(TAG,"BoostFramework() : Exception_1 = " + e);
-                }
-                // Every Scroller builds one of these, so a failed lookup must not repeat.
-                sIsLoaded = true;
 // QTI_END: 2018-02-20: Performance: BoostFramework: To Enhance performance.
 // QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
                 // Load UXE Class now Adding new try/catch block to avoid
                 // any interference with Qperformance
-                try {
-                    sUxPerfClass = Class.forName(UXPERFORMANCE_CLASS);
+                if (new File(UXPERFORMANCE_JAR).exists()) {
+                    try {
+                        sUxPerfClass = Class.forName(UXPERFORMANCE_CLASS);
 
-                    Class[] argUxClasses = new Class[] {int.class, String.class, String.class};
+                        Class[] argUxClasses = new Class[] {int.class, String.class, String.class};
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
 // QTI_BEGIN: 2019-05-30: Core: Perf: Change for AGPE
-                    sUxIOPStart = sUxPerfClass.getDeclaredMethod("perfIOPrefetchStart", argUxClasses);
+                        sUxIOPStart = sUxPerfClass.getDeclaredMethod("perfIOPrefetchStart", argUxClasses);
 // QTI_END: 2019-05-30: Core: Perf: Change for AGPE
 // QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
 
-                    sUxIsLoaded = true;
+                        sUxIsLoaded = true;
+                    }
+                    catch(Exception e) {
+                        Log.d(TAG,"BoostFramework() Ux Perf: Exception = " + e);
+                    }
                 }
-                catch(Exception e) {
-                    Log.d(TAG,"BoostFramework() Ux Perf: Exception = " + e);
-                }
+                // Every Scroller builds one of these, so a missing jar must not retry or throw.
+                sIsLoaded = true;
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
 // QTI_BEGIN: 2018-02-20: Performance: BoostFramework: To Enhance performance.
             }
@@ -625,20 +634,24 @@ public class BoostFramework {
 /** @hide */
     public int perfIOPrefetchStart(int pid, String pkgName, String codePath) {
         int ret = -1;
-        try {
-            Object retVal = sIOPStart.invoke(mPerf, pid, pkgName, codePath);
-            ret = (int) retVal;
-        } catch (Exception e) {
-            Log.e(TAG, "Exception " + e);
+        if (sIOPStart != null) {
+            try {
+                Object retVal = sIOPStart.invoke(mPerf, pid, pkgName, codePath);
+                ret = (int) retVal;
+            } catch (Exception e) {
+                Log.e(TAG, "Exception " + e);
+            }
         }
-        try {
+        if (sUxIOPStart != null) {
+            try {
 // QTI_END: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
 // QTI_BEGIN: 2019-05-30: Core: Perf: Change for AGPE
-             Object retVal = sUxIOPStart.invoke(mUxPerf, pid, pkgName, codePath);
-             ret = (int) retVal;
-         } catch (Exception e) {
-             Log.e(TAG, "Ux Perf Exception " + e);
-         }
+                 Object retVal = sUxIOPStart.invoke(mUxPerf, pid, pkgName, codePath);
+                 ret = (int) retVal;
+             } catch (Exception e) {
+                 Log.e(TAG, "Ux Perf Exception " + e);
+             }
+        }
 // QTI_END: 2019-05-30: Core: Perf: Change for AGPE
 // QTI_BEGIN: 2018-10-31: Core: IOP/UXE: This change is related to IOP and UXE Feature.
 
@@ -648,11 +661,13 @@ public class BoostFramework {
 /** @hide */
     public int perfIOPrefetchStop() {
         int ret = -1;
-        try {
-            Object retVal = sIOPStop.invoke(mPerf);
-            ret = (int) retVal;
-        } catch (Exception e) {
-            Log.e(TAG, "Exception " + e);
+        if (sIOPStop != null) {
+            try {
+                Object retVal = sIOPStop.invoke(mPerf);
+                ret = (int) retVal;
+            } catch (Exception e) {
+                Log.e(TAG, "Exception " + e);
+            }
         }
         return ret;
     }
@@ -843,7 +858,7 @@ public class BoostFramework {
                 "com.qualcomm.qti.QXPerformance.ScrollOptimizer";
         private static boolean sScrollOptProp = false;
         private static boolean sScrollOptEnable = false;
-        private static boolean sQXIsLoaded = false;
+        private static volatile boolean sQXIsLoaded = false;
         private static Class<?> sQXPerfClass = null;
         private static Method sSetFrameInterval = null;
         private static Method sDisableOptimizer = null;
@@ -920,6 +935,14 @@ public class BoostFramework {
                         e.printStackTrace();
                     }
                 }
+                return;
+            }
+            // Fast-path: do not spawn an OS thread per app process when QXPerformance is disabled/absent.
+            if (!SystemProperties.getBoolean(SCROLL_OPT_PROP, false)
+                    || !new File(QXPERFORMANCE_JAR).exists()) {
+                sScrollOptProp = false;
+                sScrollOptEnable = false;
+                sQXIsLoaded = true;
                 return;
             }
             Thread initThread = new Thread(new Runnable() {
@@ -1133,9 +1156,11 @@ public class BoostFramework {
 
         /** @hide */
         public static UIPerfMode getInstance(Context context) {
+            if (!ActivityThread.isSystem()) {
+                return null;
+            }
             synchronized(UIPerfMode.class) {
-                if (!ActivityThread.isSystem() ||
-                        !SystemProperties.getBoolean(UI_PERF_ENABLE, false)) {
+                if (!SystemProperties.getBoolean(UI_PERF_ENABLE, false)) {
                     return null;
                 }
                 if (context != null) {

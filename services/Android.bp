@@ -388,7 +388,6 @@ java_library {
         "service-rkp.stubs.system_server",
         "service-sdksandbox.stubs.system_server",
         "service-telecom.stubs.system_server",
-        "org.lineageos.platform.internal",
     ],
 
     // Uncomment to enable output of certain warnings (deprecated, unchecked)
@@ -398,7 +397,6 @@ java_library {
         ":__subpackages__",
         "//frameworks/opt:__subpackages__",
         "//vendor:__subpackages__",
-        "//lineage-sdk:__subpackages__",
     ],
 
     lint: {

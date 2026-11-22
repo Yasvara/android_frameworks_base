@@ -28,7 +28,8 @@ import static com.android.systemui.navigationbar.gestural.Utilities.isTrackpadTh
 import static com.android.systemui.shared.system.QuickStepContract.SYSUI_STATE_TOUCHPAD_GESTURES_DISABLED;
 import static com.android.wm.shell.windowdecor.DragResizeWindowGeometry.isEdgeResizePermitted;
 
-import static org.lineageos.internal.util.DeviceKeysConstants.Action;
+import com.android.internal.yasvara.YasvaraSettings;
+import com.android.internal.yasvara.YasvaraSettings.KeyAction;
 
 import static java.util.stream.Collectors.joining;
 
@@ -109,7 +110,6 @@ import com.android.wm.shell.desktopmode.api.DesktopMode;
 import com.android.wm.shell.pip.Pip;
 import com.android.wm.shell.shared.desktopmode.DesktopState;
 
-import lineageos.providers.LineageSettings;
 
 import dagger.assisted.Assisted;
 import dagger.assisted.AssistedFactory;
@@ -627,19 +627,19 @@ public class EdgeBackGestureHandler {
         if (mMLEnableWidth > mEdgeWidthLeft) mMLEnableWidth = mEdgeWidthLeft;
 
         mContext.getContentResolver().registerContentObserver(
-                LineageSettings.System.getUriFor(LineageSettings.System.KEY_EDGE_LONG_SWIPE_ACTION),
+                Settings.System.getUriFor(YasvaraSettings.System.KEY_EDGE_LONG_SWIPE_ACTION),
                 false, new ContentObserver(mUiThreadContext.getHandler()) {
                     @Override
                     public void onChange(boolean selfChange) {
-                        mIsLongSwipeEnabled = Action.fromIntSafe(
-                                LineageSettings.System.getInt(mContext.getContentResolver(),
-                                        LineageSettings.System.KEY_EDGE_LONG_SWIPE_ACTION,
-                                        Action.NOTHING.ordinal())) != Action.NOTHING;
+                        mIsLongSwipeEnabled = KeyAction.fromIntSafe(
+                                Settings.System.getInt(mContext.getContentResolver(),
+                                        YasvaraSettings.System.KEY_EDGE_LONG_SWIPE_ACTION,
+                                        KeyAction.NOTHING.ordinal())) != KeyAction.NOTHING;
                         updateLongSwipeWidth();
                     }
                 });
-        mContext.getContentResolver().notifyChange(LineageSettings.System.getUriFor(
-                LineageSettings.System.KEY_EDGE_LONG_SWIPE_ACTION), null);
+        mContext.getContentResolver().notifyChange(Settings.System.getUriFor(
+                YasvaraSettings.System.KEY_EDGE_LONG_SWIPE_ACTION), null);
 
         // Runs on every user or resource change: register once, re-read for the current user.
         if (mPentasGameObserver == null) {

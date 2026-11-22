@@ -144,13 +144,7 @@
     *;
 }
 
-# SDK
--keep,allowoptimization,allowaccessmodification class lineageos.** { *; }
--keep,allowoptimization,allowaccessmodification class org.lineageos.** { *; }
--keep,allowoptimization,allowaccessmodification class vendor.lineage.** { *; }
-
-# org.lineageos.platform is loaded into system_server as a separate jar and
-# links against these classes, which R8 cannot trace when optimizing.
+# Keep LocalServices for system_server internal lookups
 -keep class com.android.server.LocalServices { *; }
 -keep class com.android.server.ServiceThread { *; }
 -keep class com.android.server.SystemService { *; }

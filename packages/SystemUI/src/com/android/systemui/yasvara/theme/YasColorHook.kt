@@ -15,7 +15,8 @@ import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.util.settings.SecureSettings
 import javax.inject.Inject
-import lineageos.providers.LineageSettings
+import android.provider.Settings
+import com.android.internal.yasvara.YasvaraSettings
 import org.yasvara.monet.YasColorSpec
 import org.yasvara.monet.YasResolvedScheme
 import org.yasvara.monet.YasSchemeHook
@@ -62,9 +63,9 @@ constructor(
             return applied(null)
         }
         val pureBlack =
-            LineageSettings.Secure.getIntForUser(
+            Settings.Secure.getIntForUser(
                 context.contentResolver,
-                LineageSettings.Secure.BERRY_BLACK_THEME,
+                YasvaraSettings.Secure.BERRY_BLACK_THEME,
                 0,
                 userId,
             ) == 1

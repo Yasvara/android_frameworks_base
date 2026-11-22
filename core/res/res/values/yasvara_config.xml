@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+    <!-- Actions shown in the advanced restart submenu -->
+    <string-array name="config_restartActionsList" translatable="false">
+        <item>restart</item>
+        <item>restart_recovery</item>
+        <item>restart_fastboot</item>
+        <item>restart_systemui</item>
+        <item>restart_bootloader</item>
+    </string-array>
+
+    <!-- Whether side/rear fingerprint wakes and unlocks directly -->
+    <bool name="config_fingerprintWakeAndUnlock">true</bool>
+
+    <!-- Whether to clean up unused fingerprint templates in HAL -->
+    <bool name="config_cleanupUnusedFingerprints">true</bool>
+
+    <!-- Proximity check on wake -->
+    <bool name="config_proximityCheckOnWake">false</bool>
+    <bool name="config_proximityCheckOnWakeEnabledByDefault">false</bool>
+    <integer name="config_proximityCheckTimeout">250</integer>
+
+    <!-- Double tap status bar / lockscreen to sleep -->
+    <bool name="config_dt2sGestureAvailable">true</bool>
+    <bool name="config_dt2sGestureEnabledByDefault">false</bool>
+
+    <!-- Lockscreen rotation default -->
+    <bool name="config_lockScreenRotationEnabledByDefault">false</bool>
+
+    <!-- Hardware button / keyboard backlight defaults -->
+    <item name="config_buttonBrightnessSettingDefaultFloat" format="float" type="dimen">0.0</item>
+    <item name="config_keyboardBrightnessSettingDefaultFloat" format="float" type="dimen">0.0</item>
+
+    <!-- Hardware key masks (64 = volume keys only) -->
+    <integer name="config_deviceHardwareKeys">64</integer>
+    <integer name="config_deviceHardwareWakeKeys">64</integer>
+    <integer name="config_longPressOnMenuBehavior">0</integer>
+    <integer name="config_pressOnAssistBehavior">0</integer>
+    <integer name="config_longPressOnAssistBehavior">0</integer>
+    <integer name="config_longPressOnAppSwitchBehavior">0</integer>
+</resources>

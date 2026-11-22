@@ -48,7 +48,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.scan
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.suspendCancellableCoroutine
-import lineageos.providers.LineageSettings
+import android.provider.Settings
+import com.android.internal.yasvara.YasvaraSettings
 
 /** Repository-style state for battery information. */
 interface BatteryRepository {
@@ -76,13 +77,13 @@ interface BatteryRepository {
     val isStateUnknown: Flow<Boolean>
 
     /**
-     * [LineageSettings.System.STATUS_BAR_BATTERY_STYLE]. A user setting to indicate the battery
+     * [YasvaraSettings.System.STATUS_BAR_BATTERY_STYLE]. A user setting to indicate the battery
      * style in the home screen status bar
      */
     val batteryIconStyle: StateFlow<Int>
 
     /**
-     * [LineageSettings.System.STATUS_BAR_SHOW_BATTERY_PERCENT]. A user setting to indicate whether
+     * [YasvaraSettings.System.STATUS_BAR_SHOW_BATTERY_PERCENT]. A user setting to indicate whether
      * we should show the battery percentage in the home screen status bar
      */
     val showBatteryPercentMode: StateFlow<Int>
@@ -269,14 +270,14 @@ constructor(
         callbackFlow {
                 val resolver = context.contentResolver
                 val uri =
-                    LineageSettings.System.getUriFor(
-                        LineageSettings.System.STATUS_BAR_BATTERY_STYLE
+                    Settings.System.getUriFor(
+                        YasvaraSettings.System.STATUS_BAR_BATTERY_STYLE
                     )
 
                 fun readMode(): Int {
-                    return LineageSettings.System.getIntForUser(
+                    return Settings.System.getIntForUser(
                         resolver,
-                        LineageSettings.System.STATUS_BAR_BATTERY_STYLE,
+                        YasvaraSettings.System.STATUS_BAR_BATTERY_STYLE,
                         BatteryRepository.ICON_STYLE_DEFAULT,
                         UserHandle.USER_CURRENT,
                     )
@@ -314,19 +315,19 @@ constructor(
                 val resolver = context.contentResolver
                 val uris =
                     listOf(
-                        LineageSettings.System.getUriFor(
-                            LineageSettings.System.STATUS_BAR_BATTERY_STYLE
+                        Settings.System.getUriFor(
+                            YasvaraSettings.System.STATUS_BAR_BATTERY_STYLE
                         ),
-                        LineageSettings.System.getUriFor(
-                            LineageSettings.System.STATUS_BAR_SHOW_BATTERY_PERCENT
+                        Settings.System.getUriFor(
+                            YasvaraSettings.System.STATUS_BAR_SHOW_BATTERY_PERCENT
                         ),
                     )
 
                 fun readMode(): Int {
                     val iconStyle =
-                        LineageSettings.System.getIntForUser(
+                        Settings.System.getIntForUser(
                             resolver,
-                            LineageSettings.System.STATUS_BAR_BATTERY_STYLE,
+                            YasvaraSettings.System.STATUS_BAR_BATTERY_STYLE,
                             BatteryRepository.ICON_STYLE_DEFAULT,
                             UserHandle.USER_CURRENT,
                         )
@@ -336,9 +337,9 @@ constructor(
                         // Yasvara: its styles decide where the percentage goes.
                         YasBatteryStyles.percentMode(
                             iconStyle,
-                            LineageSettings.System.getIntForUser(
+                            Settings.System.getIntForUser(
                                 resolver,
-                                LineageSettings.System.STATUS_BAR_SHOW_BATTERY_PERCENT,
+                                YasvaraSettings.System.STATUS_BAR_SHOW_BATTERY_PERCENT,
                                 BatteryRepository.SHOW_PERCENT_HIDDEN,
                                 UserHandle.USER_CURRENT,
                             ),

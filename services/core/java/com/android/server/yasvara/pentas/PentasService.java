@@ -51,6 +51,7 @@ import android.os.ServiceManager;
 import android.os.ShellCallback;
 import android.os.SystemClock;
 import android.os.UserHandle;
+import android.provider.DeviceConfig;
 import android.provider.Settings;
 import android.telephony.CellSignalStrength;
 import android.telephony.SignalStrength;
@@ -140,6 +141,9 @@ public final class PentasService extends Binder {
 
     private final Context mContext;
     private final Handler mHandler = BackgroundThread.getHandler();
+    private final DeviceDisplayTouchBridge mDisplayTouchBridge;
+    private final ThermalPolicyBridge mThermalBridge;
+    private static final long PANTAU_IDLE_RELEASE_MS = 15_000L;
 
     /** Package → mode for the current user. Handler thread only. */
     private final ArrayMap<String, Integer> mModes = new ArrayMap<>();
@@ -169,6 +173,22 @@ public final class PentasService extends Binder {
     private long mLastDispKey = Long.MIN_VALUE;
     private long mLastNetKey = Long.MIN_VALUE;
     @Nullable private NetworkCapabilities mLastNetCaps;
+
+    private final Runnable mReleasePantau = () -> {
+        synchronized (mPantauLock) {
+            if (mSession == null && mHudEnabledMask == 0 && mPantau != null) {
+                mPantau = null;
+                mHydratedBinder = null;
+                mPantauTaskId = -1;
+                mLastPushedProfile = null;
+                mLastDispKey = Long.MIN_VALUE;
+                mLastNetKey = Long.MIN_VALUE;
+                mPushedUids.clear();
+                mPushedLabels.clear();
+                Binder.flushPendingCommands();
+            }
+        }
+    };
 
     private final IServiceCallback mPantauRegCb = new IServiceCallback.Stub() {
         @Override
@@ -259,6 +279,8 @@ public final class PentasService extends Binder {
 
     public PentasService(@NonNull Context context) {
         mContext = context;
+        mDisplayTouchBridge = new DeviceDisplayTouchBridge(context, mHandler);
+        mThermalBridge = new ThermalPolicyBridge(context, mHandler);
         // A value left by a previous system_server would keep that game's one-swipe back.
         mHandler.post(() -> {
             try {
@@ -313,6 +335,8 @@ public final class PentasService extends Binder {
                     endSession();
                     loadRenderScales();
                 }
+                mDisplayTouchBridge.onUserChanged();
+                mThermalBridge.onUserChanged();
                 evaluate();
             }
         }, UserHandle.ALL, users, null, mHandler);
@@ -332,6 +356,7 @@ public final class PentasService extends Binder {
                         if (p != null) {
                             pushHudProfile(p, raw);
                         }
+                        schedulePantauReleaseIfIdle();
                     }
                 }, UserHandle.USER_ALL);
         mContext.getContentResolver().registerContentObserver(
@@ -350,9 +375,10 @@ public final class PentasService extends Binder {
         mContext.registerReceiverAsUser(new BroadcastReceiver() {
             @Override
             public void onReceive(Context c, Intent intent) {
-                if (mPantau == null) return;
                 final boolean on = Intent.ACTION_SCREEN_ON.equals(intent.getAction());
                 mHandler.post(() -> {
+                    mDisplayTouchBridge.onScreenStateChanged(on);
+                    mThermalBridge.onScreenStateChanged(on);
                     final IPantau p = peekPantau();
                     if (p == null) return;
                     try {
@@ -365,6 +391,9 @@ public final class PentasService extends Binder {
         }, UserHandle.ALL, screen, null, FgThread.getHandler());
 
         mHandler.post(() -> {
+            seedDeviceConfigDefaults();
+            mDisplayTouchBridge.start();
+            mThermalBridge.start();
             mHudEnabledMask = parseEnabledMask(Settings.Secure.getStringForUser(
                     mContext.getContentResolver(), KEY_HUD_PROFILE,
                     ActivityManager.getCurrentUser()));
@@ -388,6 +417,7 @@ public final class PentasService extends Binder {
                     public void onDisplayChanged(int id) {
                         if (id == Display.DEFAULT_DISPLAY) {
                             pushDisplayState(peekPantau());
+                            mDisplayTouchBridge.onDisplayChanged();
                         }
                     }
                 }, mHandler, DisplayManager.EVENT_TYPE_DISPLAY_CHANGED
@@ -998,6 +1028,7 @@ public final class PentasService extends Binder {
         final int type = top != null ? top.getActivityType() : ACTIVITY_TYPE_HOME;
         mTopPackage = pkg;
         mTopTaskId = top != null ? top.taskId : -1;
+        mThermalBridge.onForegroundChanged(pkg != null ? pkg : "");
 
         final int user = ActivityManager.getCurrentUser();
         final int mode = pkg == null || type == ACTIVITY_TYPE_HOME || type == ACTIVITY_TYPE_RECENTS
@@ -1065,6 +1096,7 @@ public final class PentasService extends Binder {
         mSession = next;
         setGame(mode == MODE_GAME ? pkg : null, user);
         if (mode == MODE_GAME) {
+            mHandler.removeCallbacks(mReleasePantau);
             notifyPantauSession(mTopTaskId, uidOf(pkg, user), true);
         }
         if (previous != null) mContext.unbindService(previous);
@@ -1093,7 +1125,54 @@ public final class PentasService extends Binder {
             notifyPantauSession(mTopTaskId, -1, false);
         }
         mContext.unbindService(s);
+        schedulePantauReleaseIfIdle();
         Slog.i(TAG, "Session ended " + s.pkg);
+    }
+
+    private void schedulePantauReleaseIfIdle() {
+        mHandler.removeCallbacks(mReleasePantau);
+        if (mSession == null && mHudEnabledMask == 0 && mPantau != null) {
+            mHandler.postDelayed(mReleasePantau, PANTAU_IDLE_RELEASE_MS);
+        }
+    }
+
+    /**
+     * Seeds Yasvara privacy, media, and autofill DeviceConfig defaults once if unset.
+     * Replaces the standalone SimpleDeviceConfig APK with zero runtime process overhead.
+     */
+    private static void seedDeviceConfigDefaults() {
+        final String[][] defaults = {
+            {"privacy", "location_indicators_enabled", "true"},
+            {"privacy", "location_indicator_settings_enabled", "true"},
+            {"privacy", "discrete_history_ops_cslist",
+                "0,109,1,108,26,101,27,102,106,100,8,9,6,7,4,5,62,59,60,90,77,111,114,112,"
+                + "51,65,13,6,7,52,53,54,69,74,79,113,20,16,14,19,18,57"},
+            {"attention_manager_service", "keep_screen_on_enabled", "false"},
+            {"mediaprovider", "allowed_cloud_providers",
+                "com.google.android.apps.photos.cloudpicker"},
+            {"autofill", "compat_mode_allowed_packages",
+                "com.android.chrome[url_bar]:com.brave.browser[url_bar]:"
+                + "com.brave.browser_beta[url_bar]:com.brave.browser_nightly[url_bar]:"
+                + "com.chrome.beta[url_bar]:com.chrome.dev[url_bar]:com.chrome.canary[url_bar]:"
+                + "com.microsoft.emmx[url_bar]:com.microsoft.emmx.beta[url_bar]:"
+                + "com.microsoft.emmx.canary[url_bar]:com.microsoft.emmx.dev[url_bar]:"
+                + "com.opera.browser[url_field]:com.opera.browser.beta[url_bar]:"
+                + "com.opera.mini.native[url_bar]:com.opera.mini.native.beta[url_bar]:"
+                + "com.sec.android.app.sbrowser[location_bar_edit_text]:"
+                + "com.sec.android.app.sbrowser.beta[location_bar_edit_text]:"
+                + "org.mozilla.fennec_aurora[url_bar]:org.mozilla.firefox[url_bar]:"
+                + "org.mozilla.firefox_beta[url_bar]:org.chromium.chrome[url_bar]"},
+        };
+        for (String[] entry : defaults) {
+            try {
+                if (DeviceConfig.getProperty(entry[0], entry[1]) == null) {
+                    DeviceConfig.setProperty(entry[0], entry[1], entry[2], false);
+                }
+            } catch (Throwable t) {
+                Slog.w(TAG, "seedDeviceConfigDefaults failed for "
+                        + entry[0] + "/" + entry[1], t);
+            }
+        }
     }
 
     /** Publishes the session game; a write only when it changes, so a few per session. */

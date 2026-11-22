@@ -99,7 +99,7 @@ import com.google.ux.material.libmonet.dynamiccolor.MaterialDynamicColors;
 import kotlinx.coroutines.flow.Flow;
 import kotlinx.coroutines.flow.StateFlow;
 
-import lineageos.providers.LineageSettings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -540,7 +540,7 @@ public class ThemeOverlayController implements CoreStartable, Dumpable {
         mContrast = uiModeManager.getContrast();
 
         mSecureSettings.registerContentObserverForUserSync(
-                LineageSettings.Secure.getUriFor(LineageSettings.Secure.BERRY_BLACK_THEME),
+                Settings.Secure.getUriFor(YasvaraSettings.Secure.BERRY_BLACK_THEME),
                 false,
                 new ContentObserver(mBgHandler) {
                     @Override
@@ -925,8 +925,8 @@ public class ThemeOverlayController implements CoreStartable, Dumpable {
             }
         }
 
-        final boolean useBlackTheme = LineageSettings.Secure.getIntForUser(
-                mContext.getContentResolver(), LineageSettings.Secure.BERRY_BLACK_THEME,
+        final boolean useBlackTheme = Settings.Secure.getIntForUser(
+                mContext.getContentResolver(), YasvaraSettings.Secure.BERRY_BLACK_THEME,
                 0, currentUser) == 1
                 // Yasvara: a colour spec draws pure black in its own neutral overlay.
                 && !mYasActive;

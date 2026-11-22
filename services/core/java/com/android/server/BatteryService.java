@@ -92,9 +92,6 @@ import com.android.server.health.HealthServiceWrapper;
 import com.android.server.lights.LightsManager;
 import com.android.server.lights.LogicalLight;
 
-import org.lineageos.internal.notification.LedValues;
-import org.lineageos.internal.notification.LineageBatteryLights;
-
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
@@ -381,8 +378,6 @@ public final class BatteryService extends SystemService {
 
     private MetricsLogger mMetricsLogger;
 
-    private LineageBatteryLights mLineageBatteryLights;
-
     private static final int MSG_BROADCAST_BATTERY_CHANGED = 1;
     private static final int MSG_BROADCAST_POWER_CONNECTION_CHANGED = 2;
     private static final int MSG_BROADCAST_BATTERY_LOW_OKAY = 3;
@@ -543,16 +538,6 @@ public final class BatteryService extends SystemService {
                         false, obs, UserHandle.USER_ALL);
                 updateBatteryWarningLevelLocked();
             }
-        } else if (phase == PHASE_BOOT_COMPLETED) {
-            mLineageBatteryLights = new LineageBatteryLights(mContext,
-                    new LineageBatteryLights.LedUpdater() {
-                public void update() {
-                    updateLedPulse();
-                }
-            });
-
-            // Update light state now that mLineageBatteryLights has been initialized.
-            updateLedPulse();
         }
     }
 
@@ -1835,37 +1820,27 @@ public final class BatteryService extends SystemService {
             if (mBatteryLight == null) {
                 return;
             }
-            // mHealthInfo could be null on startup (called by SettingsObserver)
             if (mHealthInfo == null) {
-                Slog.w(TAG, "updateLightsLocked: mHealthInfo is null; skipping");
                 return;
             }
-            // mLineageBatteryLights is initialized during PHASE_BOOT_COMPLETED
-            // This means we don't have Lineage battery settings yet so skip.
-            if (mLineageBatteryLights == null) {
-                if (DEBUG) {
-                    Slog.w(TAG, "updateLightsLocked: mLineageBatteryLights is not yet ready; "
-                            + "skipping");
+            final int level = mHealthInfo.batteryLevel;
+            final int status = mHealthInfo.batteryStatus;
+            if (level < mLowBatteryWarningLevel) {
+                if (status == BatteryManager.BATTERY_STATUS_CHARGING) {
+                    mBatteryLight.setColor(mBatteryLowARGB);
+                } else {
+                    mBatteryLight.setFlashing(mBatteryLowARGB, LogicalLight.LIGHT_FLASH_TIMED,
+                            mBatteryLedOn, mBatteryLedOff);
                 }
-                return;
-            }
-            if (!mLineageBatteryLights.isSupported()) {
-                return;
-            }
-
-            LedValues ledValues = new LedValues(0 /* color */, mBatteryLedOn, mBatteryLedOff);
-            mLineageBatteryLights.calcLights(ledValues, mHealthInfo.batteryLevel,
-                    mHealthInfo.batteryStatus, mHealthInfo.batteryLevel <= mLowBatteryWarningLevel);
-
-            if (!ledValues.isEnabled()) {
-                mBatteryLight.turnOff();
-            } else if (ledValues.isPulsed()) {
-                mBatteryLight.setModes(ledValues.getBrightness());
-                mBatteryLight.setFlashing(ledValues.getColor(), LogicalLight.LIGHT_FLASH_TIMED,
-                        ledValues.getOnMs(), ledValues.getOffMs());
+            } else if (status == BatteryManager.BATTERY_STATUS_CHARGING
+                    || status == BatteryManager.BATTERY_STATUS_FULL) {
+                if (status == BatteryManager.BATTERY_STATUS_FULL || level >= 90) {
+                    mBatteryLight.setColor(mBatteryFullARGB);
+                } else {
+                    mBatteryLight.setColor(mBatteryMediumARGB);
+                }
             } else {
-                mBatteryLight.setModes(ledValues.getBrightness());
-                mBatteryLight.setColor(ledValues.getColor());
+                mBatteryLight.turnOff();
             }
         }
     }

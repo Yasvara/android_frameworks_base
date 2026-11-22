@@ -36,8 +36,6 @@ import android.os.UserManager;
 import android.provider.Settings;
 import android.util.Slog;
 
-import lineageos.providers.LineageSettings;
-
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.lang.reflect.Field;
@@ -96,34 +94,6 @@ final public class SettingsService extends Binder {
                 mProvider.dumpProto(fd);
             } else {
                 mProvider.dumpInternal(fd, pw, args);
-
-                // Dump LineageSettings per user, as they would appear if listed via shell.
-                final UserManager userManager = UserManager.get(mProvider.getContext());
-                for (UserInfo user : userManager.getAliveUsers()) {
-                    final String[] tables = new String[] { "GLOBAL", "SECURE", "SYSTEM" };
-                    for (String table : Arrays.asList(tables)) {
-                        pw.println("LINEAGE " + table + " SETTINGS (user " + user.id + ")");
-
-                        // shellCmd will create its own buffered writer for the same fd,
-                        // so we must flush.
-                        pw.flush();
-
-                        // Prepare and execute the shell command.
-                        final MyShellCommand shellCmd = new MyShellCommand(mProvider,
-                                true /* dumping */);
-                        final String[] cmdArgs = new String[] {
-                                "list",
-                                "--lineage",
-                                "--user",
-                                String.valueOf(user.id),
-                                table.toLowerCase()
-                        };
-                        shellCmd.exec(this, null /* in */, fd /* out */, fd /* err */,
-                                cmdArgs, null /* callback */, null /* resultReceiver */);
-
-                        pw.println();
-                    }
-                }
             }
         } finally {
             Binder.restoreCallingIdentity(ident);
@@ -156,7 +126,6 @@ final public class SettingsService extends Binder {
         int mResetMode = -1;
         boolean mMakeDefault;
         boolean mOverrideableByRestore;
-        boolean mUseLineageSettingsProvider;
 
         MyShellCommand(SettingsProvider provider, boolean dumping) {
             mProvider = provider;
@@ -164,15 +133,14 @@ final public class SettingsService extends Binder {
         }
 
         private String getSettingsAuthority() {
-            return mUseLineageSettingsProvider ? LineageSettings.AUTHORITY : Settings.AUTHORITY;
+            return Settings.AUTHORITY;
         }
 
         private String getCallMethod(String callMethod) {
             final PrintWriter perr = getErrPrintWriter();
 
             try {
-                Class clazz = mUseLineageSettingsProvider ? LineageSettings.class : Settings.class;
-                Field field = clazz.getField(callMethod);
+                Field field = Settings.class.getField(callMethod);
                 if (field.getType() == String.class) {
                     return (String) field.get(null);
                 }
@@ -217,8 +185,6 @@ final public class SettingsService extends Binder {
                     } catch (NumberFormatException e) {
                         throw new IllegalArgumentException("Bad deviceId number: " + arg);
                     }
-                } else if ("--lineage".equals(arg)) {
-                    mUseLineageSettingsProvider = true;
                 } else if (mVerb == CommandVerb.UNSPECIFIED) {
                     if ("get".equalsIgnoreCase(arg)) {
                         mVerb = CommandVerb.GET;

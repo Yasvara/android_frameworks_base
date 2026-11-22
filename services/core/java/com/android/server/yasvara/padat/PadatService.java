@@ -83,6 +83,8 @@ public final class PadatService extends IYasvaraPadat.Stub {
     private static final long POST_SESSION_SYNC_DELAY_MS = TimeUnit.SECONDS.toMillis(90);
     private static final long DAEMON_WAKE_TIMEOUT_MS = 2500L;
     private static final long DAEMON_WAKE_BACKOFF_MS = 3000L;
+    private static final long DAEMON_IDLE_RELEASE_MS = 10_000L;
+    private static final File POLICY_FILE = new File("/data/system/padat/policy.json");
 
     private static volatile PadatService sInstance;
 
@@ -96,6 +98,12 @@ public final class PadatService extends IYasvaraPadat.Stub {
     private final Object mDaemonLock = new Object();
     private IPadat mDaemon;
     private volatile long mLastDaemonWakeFailMs = 0L;
+    private final Runnable mReleaseDaemonRunnable = () -> {
+        synchronized (mDaemonLock) {
+            mDaemon = null;
+        }
+        Binder.flushPendingCommands();
+    };
 
     private final Object mPolicyLock = new Object();
     private boolean mPolicyLoaded = false;
@@ -272,8 +280,16 @@ public final class PadatService extends IYasvaraPadat.Stub {
     }
 
     private void onBootCompleted() {
-        ensurePolicyLoaded();
         hookArtDexoptCallback();
+        // Zero boot overhead when Padat has never been configured: do not wake padatd on boot
+        // unless a policy file already exists.
+        if (!POLICY_FILE.exists()) {
+            synchronized (mPolicyLock) {
+                mPolicyLoaded = true;
+            }
+            return;
+        }
+        ensurePolicyLoaded();
         // Clean up any `.padat.*.tmp` orphaned by a sudden power loss.
         try {
             final IPadat d = requireDaemon();
@@ -557,10 +573,16 @@ public final class PadatService extends IYasvaraPadat.Stub {
         return 0;
     }
 
+    private void scheduleDaemonRelease() {
+        mEventHandler.removeCallbacks(mReleaseDaemonRunnable);
+        mEventHandler.postDelayed(mReleaseDaemonRunnable, DAEMON_IDLE_RELEASE_MS);
+    }
+
     @Nullable
     IPadat peekDaemon() {
         synchronized (mDaemonLock) {
             if (mDaemon != null && mDaemon.asBinder().isBinderAlive()) {
+                scheduleDaemonRelease();
                 return mDaemon;
             }
         }
@@ -645,6 +667,7 @@ public final class PadatService extends IYasvaraPadat.Stub {
         synchronized (mDaemonLock) {
             mDaemon = proxy;
         }
+        scheduleDaemonRelease();
         return proxy;
     }
 

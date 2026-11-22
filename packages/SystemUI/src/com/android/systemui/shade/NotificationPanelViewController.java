@@ -221,7 +221,8 @@ import kotlinx.coroutines.CoroutineDispatcher;
 import kotlinx.coroutines.flow.MutableStateFlow;
 import kotlinx.coroutines.flow.StateFlow;
 
-import lineageos.providers.LineageSettings;
+import android.provider.Settings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -808,9 +809,9 @@ public final class NotificationPanelViewController implements
         mDoubleTapToSleepObserver = new ContentObserver(handler) {
             @Override
             public void onChange(boolean selfChange) {
-                mDoubleTapToSleepEnabled = LineageSettings.System.getInt(mContentResolver,
-                        LineageSettings.System.DOUBLE_TAP_SLEEP_GESTURE,
-                        mResources.getBoolean(org.lineageos.platform.internal.R.bool.
+                mDoubleTapToSleepEnabled = Settings.System.getInt(mContentResolver,
+                        YasvaraSettings.System.DOUBLE_TAP_SLEEP_GESTURE,
+                        mResources.getBoolean(com.android.internal.R.bool.
                                 config_dt2sGestureEnabledByDefault) ? 1 : 0) != 0;
             }
         };
@@ -3689,8 +3690,8 @@ public final class NotificationPanelViewController implements
                 mStatusBarStateListener.onStateChanged(mStatusBarStateController.getState(), true);
             }
             mConfigurationController.addCallback(mConfigurationListener);
-            mContentResolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.DOUBLE_TAP_SLEEP_GESTURE), false,
+            mContentResolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.DOUBLE_TAP_SLEEP_GESTURE), false,
                     mDoubleTapToSleepObserver);
             mDoubleTapToSleepObserver.onChange(true);
             // Theme might have changed between inflating this view and attaching it to the

@@ -98,7 +98,7 @@ import com.android.server.input.data.InputDataStore;
 import com.android.server.pm.UserManagerInternal;
 import com.android.server.wm.WindowManagerInternal;
 
-import lineageos.providers.LineageSettings;
+import com.android.internal.yasvara.YasvaraSettings;
 
 import org.xmlpull.v1.XmlPullParserException;
 
@@ -330,11 +330,11 @@ final class KeyGestureController {
                 Settings.Global.KEY_CHORD_POWER_VOLUME_UP,
                 mContext.getResources().getInteger(
                         com.android.internal.R.integer.config_keyChordPowerVolumeUp));
-        mClickPartialScreenshot = LineageSettings.System.getIntForUser(resolver,
-                LineageSettings.System.CLICK_PARTIAL_SCREENSHOT, 0,
+        mClickPartialScreenshot = Settings.System.getIntForUser(resolver,
+                YasvaraSettings.System.CLICK_PARTIAL_SCREENSHOT, 0,
                 UserHandle.USER_CURRENT) == 1;
-        mVolUpAndDownMute = LineageSettings.System.getIntForUser(resolver,
-                LineageSettings.System.VOLUME_UP_AND_DOWN_MUTE, 0,
+        mVolUpAndDownMute = Settings.System.getIntForUser(resolver,
+                YasvaraSettings.System.VOLUME_UP_AND_DOWN_MUTE, 0,
                 UserHandle.USER_CURRENT) == 1;
     }
 
@@ -1805,11 +1805,11 @@ final class KeyGestureController {
             resolver.registerContentObserver(Settings.Global.getUriFor(
                             Settings.Global.KEY_CHORD_POWER_VOLUME_UP), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                            LineageSettings.System.CLICK_PARTIAL_SCREENSHOT), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                            YasvaraSettings.System.CLICK_PARTIAL_SCREENSHOT), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.VOLUME_UP_AND_DOWN_MUTE), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.VOLUME_UP_AND_DOWN_MUTE), false, this,
                     UserHandle.USER_ALL);
         }
 

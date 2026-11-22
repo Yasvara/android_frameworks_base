@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources>
+    <java-symbol type="array" name="config_restartActionsList" />
+    <java-symbol type="bool" name="config_fingerprintWakeAndUnlock" />
+    <java-symbol type="bool" name="config_cleanupUnusedFingerprints" />
+    <java-symbol type="bool" name="config_proximityCheckOnWake" />
+    <java-symbol type="bool" name="config_proximityCheckOnWakeEnabledByDefault" />
+    <java-symbol type="integer" name="config_proximityCheckTimeout" />
+    <java-symbol type="bool" name="config_dt2sGestureAvailable" />
+    <java-symbol type="bool" name="config_dt2sGestureEnabledByDefault" />
+    <java-symbol type="bool" name="config_lockScreenRotationEnabledByDefault" />
+    <java-symbol type="dimen" name="config_buttonBrightnessSettingDefaultFloat" />
+    <java-symbol type="dimen" name="config_keyboardBrightnessSettingDefaultFloat" />
+    <java-symbol type="integer" name="config_deviceHardwareKeys" />
+    <java-symbol type="integer" name="config_deviceHardwareWakeKeys" />
+    <java-symbol type="integer" name="config_longPressOnMenuBehavior" />
+    <java-symbol type="integer" name="config_pressOnAssistBehavior" />
+    <java-symbol type="integer" name="config_longPressOnAssistBehavior" />
+    <java-symbol type="integer" name="config_longPressOnAppSwitchBehavior" />
+</resources>

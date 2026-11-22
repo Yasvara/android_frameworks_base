@@ -116,7 +116,7 @@ import static com.android.server.power.feature.flags.Flags.interactiveDozeExperi
 import static com.android.systemui.shared.Flags.brightnessDialogOnSystemUser;
 import static com.android.window.flags.Flags.commitKeyguardOcclusionBeforeWakingUp;
 
-import static org.lineageos.internal.util.DeviceKeysConstants.*;
+import static com.android.internal.yasvara.YasvaraSettings.*;
 
 import android.accessibilityservice.AccessibilityService;
 import android.annotation.NonNull;
@@ -275,10 +275,8 @@ import com.android.server.wm.WindowManagerInternal.AppTransitionListener;
 
 import dalvik.system.PathClassLoader;
 
-import lineageos.providers.LineageSettings;
+import com.android.internal.yasvara.YasvaraSettings;
 
-import org.lineageos.internal.buttons.LineageButtons;
-import org.lineageos.internal.util.ActionUtils;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -679,16 +677,16 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     Intent mVrHeadsetHomeIntent;
 
     // Tracks user-customisable behavior for certain key events
-    private Action mBackLongPressAction;
-    private Action mHomeLongPressAction;
-    private Action mHomeDoubleTapAction;
-    private Action mMenuPressAction;
-    private Action mMenuLongPressAction;
-    private Action mAssistPressAction;
-    private Action mAssistLongPressAction;
-    private Action mAppSwitchPressAction;
-    private Action mAppSwitchLongPressAction;
-    private Action mEdgeLongSwipeAction;
+    private KeyAction mBackLongPressAction;
+    private KeyAction mHomeLongPressAction;
+    private KeyAction mHomeDoubleTapAction;
+    private KeyAction mMenuPressAction;
+    private KeyAction mMenuLongPressAction;
+    private KeyAction mAssistPressAction;
+    private KeyAction mAssistLongPressAction;
+    private KeyAction mAppSwitchPressAction;
+    private KeyAction mAppSwitchLongPressAction;
+    private KeyAction mEdgeLongSwipeAction;
 
     // support for activating the lock screen while the screen is on
     private HashSet<Integer> mAllowLockscreenWhenOnDisplays = new HashSet<>();
@@ -706,7 +704,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     int mIncallBackBehavior;
 
     // Behavior of HOME button during an incoming call.
-    // (See LineageSettings.Secure.RING_HOME_BUTTON_BEHAVIOR.)
+    // (See YasvaraSettings.Secure.RING_HOME_BUTTON_BEHAVIOR.)
     int mRingHomeBehavior;
 
     // Whether system navigation keys are enabled
@@ -782,7 +780,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private final List<DeviceKeyHandler> mDeviceKeyHandlers = new ArrayList<>();
 
-    private LineageButtons mLineageButtons;
 
     private final boolean mVisibleBackgroundUsersEnabled = isVisibleBackgroundUsersEnabled();
 
@@ -1014,74 +1011,74 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                     Settings.Secure.NAV_BAR_KIDS_MODE), false, this,
                     UserHandle.USER_ALL);
 
-            resolver.registerContentObserver(LineageSettings.Secure.getUriFor(
-                    LineageSettings.Secure.RING_HOME_BUTTON_BEHAVIOR), false, this,
+            resolver.registerContentObserver(Settings.Secure.getUriFor(
+                    YasvaraSettings.Secure.RING_HOME_BUTTON_BEHAVIOR), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.CAMERA_SLEEP_ON_RELEASE), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.CAMERA_SLEEP_ON_RELEASE), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.CAMERA_LAUNCH), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.CAMERA_LAUNCH), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.TORCH_LONG_PRESS_POWER_GESTURE), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.TORCH_LONG_PRESS_POWER_GESTURE), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.TORCH_LONG_PRESS_POWER_TIMEOUT), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.TORCH_LONG_PRESS_POWER_TIMEOUT), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_BACK_LONG_PRESS_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_BACK_LONG_PRESS_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_HOME_LONG_PRESS_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_HOME_LONG_PRESS_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_HOME_DOUBLE_TAP_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_HOME_DOUBLE_TAP_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_MENU_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_MENU_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_MENU_LONG_PRESS_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_MENU_LONG_PRESS_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_ASSIST_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_ASSIST_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_ASSIST_LONG_PRESS_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_ASSIST_LONG_PRESS_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_APP_SWITCH_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_APP_SWITCH_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_APP_SWITCH_LONG_PRESS_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_APP_SWITCH_LONG_PRESS_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.KEY_EDGE_LONG_SWIPE_ACTION), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.KEY_EDGE_LONG_SWIPE_ACTION), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.CAMERA_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.CAMERA_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.HOME_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.HOME_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.BACK_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.BACK_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.MENU_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.MENU_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.ASSIST_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.ASSIST_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.APP_SWITCH_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.APP_SWITCH_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.VOLUME_WAKE_SCREEN), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.VOLUME_WAKE_SCREEN), false, this,
                     UserHandle.USER_ALL);
-            resolver.registerContentObserver(LineageSettings.System.getUriFor(
-                    LineageSettings.System.VOLUME_ANSWER_CALL), false, this,
+            resolver.registerContentObserver(Settings.System.getUriFor(
+                    YasvaraSettings.System.VOLUME_ANSWER_CALL), false, this,
                     UserHandle.USER_ALL);
             updateSettings();
         }
@@ -1772,7 +1769,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private void appSwitchPress() {
         if (canPerformKeyAction(mAppSwitchPressAction)) {
-            if (mAppSwitchPressAction != Action.APP_SWITCH) {
+            if (mAppSwitchPressAction != KeyAction.APP_SWITCH) {
                 cancelPreloadRecentApps();
             }
             long now = SystemClock.uptimeMillis();
@@ -1786,7 +1783,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private void appSwitchLongPress() {
         if (canPerformKeyAction(mAppSwitchLongPressAction)) {
-            if (mAppSwitchLongPressAction != Action.APP_SWITCH) {
+            if (mAppSwitchLongPressAction != KeyAction.APP_SWITCH) {
                 cancelPreloadRecentApps();
             }
 
@@ -1802,7 +1799,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private void assistPress() {
         if (canPerformKeyAction(mAssistPressAction)) {
-            if (mAssistPressAction != Action.APP_SWITCH) {
+            if (mAssistPressAction != KeyAction.APP_SWITCH) {
                 cancelPreloadRecentApps();
             }
             long now = SystemClock.uptimeMillis();
@@ -1817,7 +1814,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private void assistLongPress() {
         if (canPerformKeyAction(mAssistLongPressAction)) {
-            if (mAssistLongPressAction != Action.APP_SWITCH) {
+            if (mAssistLongPressAction != KeyAction.APP_SWITCH) {
                 cancelPreloadRecentApps();
             }
 
@@ -2073,7 +2070,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
     }
 
     private boolean hasLongPressOnBackBehavior() {
-        return mBackLongPressAction != Action.NOTHING;
+        return mBackLongPressAction != KeyAction.NOTHING;
     }
 
     private boolean hasLongPressOnStemPrimaryBehavior() {
@@ -2298,7 +2295,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private void launchCameraAction() {
         sendCloseSystemWindows();
-        Intent intent = new Intent(lineageos.content.Intent.ACTION_SCREEN_CAMERA_GESTURE);
+        Intent intent = new Intent("android.intent.action.CAMERA_BUTTON");
         mContext.sendBroadcast(intent, android.Manifest.permission.STATUS_BAR_SERVICE);
     }
 
@@ -2313,7 +2310,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         mInputManager.injectInputEvent(upEvent, InputManager.INJECT_INPUT_EVENT_MODE_ASYNC);
     }
 
-    private boolean canPerformKeyAction(Action action) {
+    private boolean canPerformKeyAction(KeyAction action) {
         switch (action) {
             case NOTHING:
                 return false;
@@ -2330,12 +2327,12 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         }
     }
 
-    private void performKeyAction(Action action, KeyEvent event) {
+    private void performKeyAction(KeyAction action, KeyEvent event) {
         // By default, pass INVOCATION_TYPE_UNKNOWN to launch assistant.
         performKeyAction(action, event, AssistUtils.INVOCATION_TYPE_UNKNOWN);
     }
 
-    private void performKeyAction(Action action, KeyEvent event, int assistInvocationType) {
+    private void performKeyAction(KeyAction action, KeyEvent event, int assistInvocationType) {
         switch (action) {
             case NOTHING:
                 break;
@@ -2364,13 +2361,13 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 mPowerManager.goToSleep(SystemClock.uptimeMillis());
                 break;
             case LAST_APP:
-                ActionUtils.switchToLastApp(mContext, mCurrentUserId);
+                switchToLastApp();
                 break;
             case SPLIT_SCREEN:
                 toggleSplitScreen();
                 break;
             case KILL_APP:
-                ActionUtils.killForegroundApp(mContext, mCurrentUserId);
+                killForegroundApp();
                 break;
             case PLAY_PAUSE_MUSIC:
                 triggerVirtualKeypress(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE);
@@ -2461,7 +2458,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
             // If we have released the home key, and didn't do anything else
             // while it was pressed, then it is time to go home!
             if (!down) {
-                if (mDisplayId == DEFAULT_DISPLAY && mHomeDoubleTapAction != Action.APP_SWITCH) {
+                if (mDisplayId == DEFAULT_DISPLAY && mHomeDoubleTapAction != KeyAction.APP_SWITCH) {
                     cancelPreloadRecentApps();
                 }
 
@@ -2477,7 +2474,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 }
 
                 if ((mRingHomeBehavior
-                        & LineageSettings.Secure.RING_HOME_BUTTON_BEHAVIOR_ANSWER) != 0) {
+                        & YasvaraSettings.Secure.RING_HOME_BUTTON_BEHAVIOR_ANSWER) != 0) {
                     final TelecomManager telecomManager = getTelecommService();
                     if (telecomManager != null && telecomManager.isRinging()) {
                         telecomManager.acceptRingingCall();
@@ -2486,7 +2483,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 }
 
                 // Delay handling home if a double-tap is possible.
-                if (mHomeDoubleTapAction != Action.NOTHING) {
+                if (mHomeDoubleTapAction != KeyAction.NOTHING) {
                     mHandler.removeCallbacks(mHomeDoubleTapTimeoutRunnable); // just in case
                     mPendingHomeKeyEvent = event;
                     mHandler.postDelayed(mHomeDoubleTapTimeoutRunnable,
@@ -2530,13 +2527,13 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                     performKeyAction(mHomeDoubleTapAction, event);
                     mHomeConsumed = true;
                 } else if (mDisplayId == DEFAULT_DISPLAY
-                        && (mHomeLongPressAction == Action.APP_SWITCH
-                            || mHomeDoubleTapAction == Action.APP_SWITCH)) {
+                        && (mHomeLongPressAction == KeyAction.APP_SWITCH
+                            || mHomeDoubleTapAction == KeyAction.APP_SWITCH)) {
                     preloadRecentApps();
                 }
             } else if (longPress) {
                 if (!mHomeConsumed && canPerformKeyAction(mHomeLongPressAction)) {
-                    if (mHomeLongPressAction != Action.APP_SWITCH) {
+                    if (mHomeLongPressAction != KeyAction.APP_SWITCH) {
                         cancelPreloadRecentApps();
                     }
                     mHomePressed = true;
@@ -2798,7 +2795,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 com.android.internal.R.string.config_searchKeyTargetActivity));
 
         mDeviceHardwareKeys = mContext.getResources().getInteger(
-                org.lineageos.platform.internal.R.integer.config_deviceHardwareKeys);
+                com.android.internal.R.integer.config_deviceHardwareKeys);
         updateKeyAssignments();
 
         mTurnOffTvToastSuppressionDelay = mContext.getResources().getInteger(
@@ -2893,29 +2890,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 interactiveDozeExperience()
                         && mContext.getResources().getBoolean(
                                 com.android.internal.R.bool.config_enableInteractiveDoze);
-
-        final String[] deviceKeyHandlerLibs = res.getStringArray(
-                org.lineageos.platform.internal.R.array.config_deviceKeyHandlerLibs);
-        final String[] deviceKeyHandlerClasses = res.getStringArray(
-                org.lineageos.platform.internal.R.array.config_deviceKeyHandlerClasses);
-
-        for (int i = 0;
-                i < deviceKeyHandlerLibs.length && i < deviceKeyHandlerClasses.length; i++) {
-            try {
-                PathClassLoader loader = new PathClassLoader(
-                        deviceKeyHandlerLibs[i], getClass().getClassLoader());
-                Class<?> klass = loader.loadClass(deviceKeyHandlerClasses[i]);
-                Constructor<?> constructor = klass.getConstructor(Context.class);
-                mDeviceKeyHandlers.add((DeviceKeyHandler) constructor.newInstance(mContext));
-            } catch (Exception e) {
-                Slog.w(TAG, "Could not instantiate device key handler "
-                        + deviceKeyHandlerLibs[i] + " from class "
-                        + deviceKeyHandlerClasses[i], e);
-            }
-        }
-        if (DEBUG_INPUT) {
-            Slog.d(TAG, "" + mDeviceKeyHandlers.size() + " device key handlers loaded");
-        }
 
         // Register for torch off events
         BroadcastReceiver torchReceiver = new BroadcastReceiver() {
@@ -3082,7 +3056,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
         @Override
         public boolean supportLongPress() {
-            return mAppSwitchLongPressAction != Action.NOTHING;
+            return mAppSwitchLongPressAction != KeyAction.NOTHING;
         }
 
         @Override
@@ -3116,7 +3090,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
         @Override
         public boolean supportLongPress() {
-            return mAssistLongPressAction != Action.NOTHING;
+            return mAssistLongPressAction != KeyAction.NOTHING;
         }
 
         @Override
@@ -3377,65 +3351,65 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         final Resources res = mContext.getResources();
 
         // Initialize all assignments to sane defaults.
-        mBackLongPressAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_longPressOnBackBehavior));
-        mHomeLongPressAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_longPressOnHomeBehavior));
-        mHomeDoubleTapAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_doubleTapOnHomeBehavior));
-        mMenuPressAction = Action.MENU;
-        mMenuLongPressAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_longPressOnMenuBehavior));
-        if (mMenuLongPressAction == Action.NOTHING && (hasMenu && !hasAssist)) {
-            mMenuLongPressAction = Action.SEARCH;
+        mBackLongPressAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_longPressOnBackBehavior));
+        mHomeLongPressAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_longPressOnHomeBehavior));
+        mHomeDoubleTapAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_doubleTapOnHomeBehavior));
+        mMenuPressAction = KeyAction.MENU;
+        mMenuLongPressAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_longPressOnMenuBehavior));
+        if (mMenuLongPressAction == KeyAction.NOTHING && (hasMenu && !hasAssist)) {
+            mMenuLongPressAction = KeyAction.SEARCH;
         }
-        mAssistPressAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_pressOnAssistBehavior));
-        mAssistLongPressAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_longPressOnAssistBehavior));
-        mAppSwitchPressAction = Action.APP_SWITCH;
-        mAppSwitchLongPressAction = Action.fromIntSafe(res.getInteger(
-                org.lineageos.platform.internal.R.integer.config_longPressOnAppSwitchBehavior));
-        mEdgeLongSwipeAction = Action.NOTHING;
+        mAssistPressAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_pressOnAssistBehavior));
+        mAssistLongPressAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_longPressOnAssistBehavior));
+        mAppSwitchPressAction = KeyAction.APP_SWITCH;
+        mAppSwitchLongPressAction = KeyAction.fromIntSafe(res.getInteger(
+                com.android.internal.R.integer.config_longPressOnAppSwitchBehavior));
+        mEdgeLongSwipeAction = KeyAction.NOTHING;
 
-        mBackLongPressAction = Action.fromSettings(resolver,
-                LineageSettings.System.KEY_BACK_LONG_PRESS_ACTION,
+        mBackLongPressAction = KeyAction.fromSettings(resolver,
+                YasvaraSettings.System.KEY_BACK_LONG_PRESS_ACTION,
                 mBackLongPressAction);
 
-        mHomeLongPressAction = Action.fromSettings(resolver,
-                LineageSettings.System.KEY_HOME_LONG_PRESS_ACTION,
+        mHomeLongPressAction = KeyAction.fromSettings(resolver,
+                YasvaraSettings.System.KEY_HOME_LONG_PRESS_ACTION,
                 mHomeLongPressAction);
-        mHomeDoubleTapAction = Action.fromSettings(resolver,
-                LineageSettings.System.KEY_HOME_DOUBLE_TAP_ACTION,
+        mHomeDoubleTapAction = KeyAction.fromSettings(resolver,
+                YasvaraSettings.System.KEY_HOME_DOUBLE_TAP_ACTION,
                 mHomeDoubleTapAction);
 
         if (hasMenu) {
-            mMenuPressAction = Action.fromSettings(resolver,
-                    LineageSettings.System.KEY_MENU_ACTION,
+            mMenuPressAction = KeyAction.fromSettings(resolver,
+                    YasvaraSettings.System.KEY_MENU_ACTION,
                     mMenuPressAction);
-            mMenuLongPressAction = Action.fromSettings(resolver,
-                    LineageSettings.System.KEY_MENU_LONG_PRESS_ACTION,
+            mMenuLongPressAction = KeyAction.fromSettings(resolver,
+                    YasvaraSettings.System.KEY_MENU_LONG_PRESS_ACTION,
                     mMenuLongPressAction);
         }
         if (hasAssist) {
-            mAssistPressAction = Action.fromSettings(resolver,
-                    LineageSettings.System.KEY_ASSIST_ACTION,
+            mAssistPressAction = KeyAction.fromSettings(resolver,
+                    YasvaraSettings.System.KEY_ASSIST_ACTION,
                     mAssistPressAction);
-            mAssistLongPressAction = Action.fromSettings(resolver,
-                    LineageSettings.System.KEY_ASSIST_LONG_PRESS_ACTION,
+            mAssistLongPressAction = KeyAction.fromSettings(resolver,
+                    YasvaraSettings.System.KEY_ASSIST_LONG_PRESS_ACTION,
                     mAssistLongPressAction);
         }
         if (hasAppSwitch) {
-            mAppSwitchPressAction = Action.fromSettings(resolver,
-                    LineageSettings.System.KEY_APP_SWITCH_ACTION,
+            mAppSwitchPressAction = KeyAction.fromSettings(resolver,
+                    YasvaraSettings.System.KEY_APP_SWITCH_ACTION,
                     mAppSwitchPressAction);
         }
-        mAppSwitchLongPressAction = Action.fromSettings(resolver,
-                LineageSettings.System.KEY_APP_SWITCH_LONG_PRESS_ACTION,
+        mAppSwitchLongPressAction = KeyAction.fromSettings(resolver,
+                YasvaraSettings.System.KEY_APP_SWITCH_LONG_PRESS_ACTION,
                 mAppSwitchLongPressAction);
 
-        mEdgeLongSwipeAction = Action.fromSettings(resolver,
-                LineageSettings.System.KEY_EDGE_LONG_SWIPE_ACTION,
+        mEdgeLongSwipeAction = KeyAction.fromSettings(resolver,
+                YasvaraSettings.System.KEY_EDGE_LONG_SWIPE_ACTION,
                 mEdgeLongSwipeAction);
 
         mShortPressOnWindowBehavior = SHORT_PRESS_WINDOW_NOTHING;
@@ -3460,7 +3434,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         boolean updateKidsModeSettings = false;
         final boolean kidsModeEnabled;
         int mDeviceHardwareWakeKeys = mContext.getResources().getInteger(
-                org.lineageos.platform.internal.R.integer.config_deviceHardwareWakeKeys);
+                com.android.internal.R.integer.config_deviceHardwareWakeKeys);
         synchronized (mLock) {
             mEndcallBehavior = Settings.System.getIntForUser(resolver,
                     Settings.System.END_BUTTON_BEHAVIOR,
@@ -3474,9 +3448,9 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                     Settings.Secure.INCALL_BACK_BUTTON_BEHAVIOR,
                     Settings.Secure.INCALL_BACK_BUTTON_BEHAVIOR_DEFAULT,
                     UserHandle.USER_CURRENT);
-            mRingHomeBehavior = LineageSettings.Secure.getIntForUser(resolver,
-                    LineageSettings.Secure.RING_HOME_BUTTON_BEHAVIOR,
-                    LineageSettings.Secure.RING_HOME_BUTTON_BEHAVIOR_DEFAULT,
+            mRingHomeBehavior = Settings.Secure.getIntForUser(resolver,
+                    YasvaraSettings.Secure.RING_HOME_BUTTON_BEHAVIOR,
+                    YasvaraSettings.Secure.RING_HOME_BUTTON_BEHAVIOR_DEFAULT,
                     UserHandle.USER_CURRENT);
             mSystemNavigationKeysEnabled = Settings.Secure.getIntForUser(resolver,
                     Settings.Secure.SYSTEM_NAVIGATION_KEYS_ENABLED,
@@ -3492,42 +3466,42 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 mRingerToggleChord = VOLUME_HUSH_OFF;
             }
 
-            mCameraLaunch = LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.CAMERA_LAUNCH, 0,
+            mCameraLaunch = Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.CAMERA_LAUNCH, 0,
                     UserHandle.USER_CURRENT) == 1;
-            mWakeOnCameraKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.CAMERA_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
+            mWakeOnCameraKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.CAMERA_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_CAMERA) != 0);
             mCameraSleepOnRelease = mWakeOnCameraKeyPress &&
-                    LineageSettings.System.getIntForUser(resolver,
-                            LineageSettings.System.CAMERA_SLEEP_ON_RELEASE, 0,
+                    Settings.System.getIntForUser(resolver,
+                            YasvaraSettings.System.CAMERA_SLEEP_ON_RELEASE, 0,
                             UserHandle.USER_CURRENT) == 1;
-            mTorchLongPressPowerEnabled = LineageSettings.System.getIntForUser(
-                    resolver, LineageSettings.System.TORCH_LONG_PRESS_POWER_GESTURE, 0,
+            mTorchLongPressPowerEnabled = Settings.System.getIntForUser(
+                    resolver, YasvaraSettings.System.TORCH_LONG_PRESS_POWER_GESTURE, 0,
                     UserHandle.USER_CURRENT) == 1;
-            mTorchTimeout = LineageSettings.System.getIntForUser(
-                    resolver, LineageSettings.System.TORCH_LONG_PRESS_POWER_TIMEOUT, 0,
+            mTorchTimeout = Settings.System.getIntForUser(
+                    resolver, YasvaraSettings.System.TORCH_LONG_PRESS_POWER_TIMEOUT, 0,
                     UserHandle.USER_CURRENT);
-            mWakeOnHomeKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.HOME_WAKE_SCREEN, 1, UserHandle.USER_CURRENT) == 1)
+            mWakeOnHomeKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.HOME_WAKE_SCREEN, 1, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_HOME) != 0);
-            mWakeOnBackKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.BACK_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
+            mWakeOnBackKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.BACK_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_BACK) != 0);
-            mWakeOnMenuKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.MENU_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
+            mWakeOnMenuKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.MENU_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_MENU) != 0);
-            mWakeOnAssistKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.ASSIST_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
+            mWakeOnAssistKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.ASSIST_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_ASSIST) != 0);
-            mWakeOnAppSwitchKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.APP_SWITCH_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
+            mWakeOnAppSwitchKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.APP_SWITCH_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_APP_SWITCH) != 0);
-            mWakeOnVolumeKeyPress = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.VOLUME_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
+            mWakeOnVolumeKeyPress = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.VOLUME_WAKE_SCREEN, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_VOLUME) != 0);
-            mVolumeAnswerCall = (LineageSettings.System.getIntForUser(resolver,
-                    LineageSettings.System.VOLUME_ANSWER_CALL, 0, UserHandle.USER_CURRENT) == 1)
+            mVolumeAnswerCall = (Settings.System.getIntForUser(resolver,
+                    YasvaraSettings.System.VOLUME_ANSWER_CALL, 0, UserHandle.USER_CURRENT) == 1)
                     && ((mDeviceHardwareWakeKeys & KEY_MASK_VOLUME) != 0);
 
             // Configure wake gesture.
@@ -4000,15 +3974,15 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 }
 
                 if (down) {
-                    if (mMenuPressAction == Action.APP_SWITCH
-                            || mMenuLongPressAction == Action.APP_SWITCH) {
+                    if (mMenuPressAction == KeyAction.APP_SWITCH
+                            || mMenuLongPressAction == KeyAction.APP_SWITCH) {
                         preloadRecentApps();
                     }
                     if (repeatCount == 0) {
                         mMenuPressed = true;
                     } else if (longPress) {
-                        if (!keyguardOn && mMenuLongPressAction != Action.NOTHING) {
-                            if (mMenuLongPressAction != Action.APP_SWITCH) {
+                        if (!keyguardOn && mMenuLongPressAction != KeyAction.NOTHING) {
+                            if (mMenuLongPressAction != KeyAction.APP_SWITCH) {
                                 cancelPreloadRecentApps();
                             }
                             performLongPressHapticFeedback(mMenuLongPressAction,
@@ -4021,7 +3995,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 }
 
                 if (!down && mMenuPressed) {
-                    if (mMenuPressAction != Action.APP_SWITCH) {
+                    if (mMenuPressAction != KeyAction.APP_SWITCH) {
                         cancelPreloadRecentApps();
                     }
                     mMenuPressed = false;
@@ -5262,8 +5236,8 @@ public class PhoneWindowManager implements WindowManagerPolicy {
             case KeyEvent.KEYCODE_APP_SWITCH: {
                 if (!keyguardOn()) {
                     if (down) {
-                        if (mAppSwitchPressAction == Action.APP_SWITCH
-                                || mAppSwitchLongPressAction == Action.APP_SWITCH) {
+                        if (mAppSwitchPressAction == KeyAction.APP_SWITCH
+                                || mAppSwitchLongPressAction == KeyAction.APP_SWITCH) {
                             preloadRecentApps();
                         }
                     }
@@ -5348,10 +5322,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                     // {@link interceptKeyBeforeDispatching()}.
                     result |= ACTION_PASS_TO_USER;
                 } else if ((result & ACTION_PASS_TO_USER) == 0 && !mWakeOnVolumeKeyPress) {
-                    if (mLineageButtons.handleVolumeKey(event, interactive)) {
-                        break;
-                    }
-
                     // If we aren't passing to the user and no one else
                     // handled it send it to the session manager to
                     // figure out.
@@ -5600,8 +5570,8 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                     }
 
                     if (!keyguardOn()) {
-                        if (mAssistPressAction == Action.APP_SWITCH
-                                || mAssistLongPressAction == Action.APP_SWITCH) {
+                        if (mAssistPressAction == KeyAction.APP_SWITCH
+                                || mAssistLongPressAction == KeyAction.APP_SWITCH) {
                             preloadRecentApps();
                         }
                     }
@@ -6784,7 +6754,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 mKeyguardDelegate.onBootCompleted();
             }
         }
-        mLineageButtons = new LineageButtons(mContext);
         mSideFpsEventHandler.onFingerprintSensorReady();
         startedWakingUp(
                 Display.DEFAULT_DISPLAY_GROUP,
@@ -7008,17 +6977,8 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         synchronized (mLock) {
             updateWakeGestureListenerLp();
         }
-        sendLidChangeBroadcast();
     }
 
-    private void sendLidChangeBroadcast() {
-        final int lidState = mDefaultDisplayPolicy.getLidState();
-        Log.d(TAG, "Sending cover change broadcast, lidState=" + lidState);
-        Intent intent = new Intent(lineageos.content.Intent.ACTION_LID_STATE_CHANGED);
-        intent.putExtra(lineageos.content.Intent.EXTRA_LID_STATE, lidState);
-        intent.setFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING);
-        mContext.sendBroadcastAsUser(intent, UserHandle.SYSTEM);
-    }
 
     void updateUiMode() {
         if (mUiModeManager == null) {
@@ -7217,8 +7177,8 @@ public class PhoneWindowManager implements WindowManagerPolicy {
         return true;
     }
 
-    private void performLongPressHapticFeedback(Action action, String reason) {
-        if (action != Action.CYCLE_RINGER_MODE) {
+    private void performLongPressHapticFeedback(KeyAction action, String reason) {
+        if (action != KeyAction.CYCLE_RINGER_MODE) {
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS, reason);
         }
     }
@@ -7848,5 +7808,40 @@ public class PhoneWindowManager implements WindowManagerPolicy {
 
     private void takeScreenshot(int type, int source) {
         mScreenshotHelper.takeScreenshot(type, source, mHandler, null);
+    }
+
+    private void switchToLastApp() {
+        try {
+            final java.util.List<android.app.ActivityManager.RecentTaskInfo> tasks =
+                    android.app.ActivityManager.getService().getRecentTasks(5,
+                            android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE, mCurrentUserId).getList();
+            for (int i = 1; i < tasks.size(); i++) {
+                final android.app.ActivityManager.RecentTaskInfo task = tasks.get(i);
+                if (task.id >= 0) {
+                    android.app.ActivityManager.getService().moveTaskToFront(null, null, task.id,
+                            android.app.ActivityManager.MOVE_TASK_NO_USER_ACTION, null);
+                    return;
+                }
+            }
+        } catch (RemoteException ignored) {
+        }
+    }
+
+    private void killForegroundApp() {
+        try {
+            if (android.app.ActivityTaskManager.getService().getLockTaskModeState()
+                    == android.app.ActivityManager.LOCK_TASK_MODE_PINNED) {
+                return;
+            }
+            final android.app.ActivityTaskManager.RootTaskInfo top =
+                    android.app.ActivityTaskManager.getService().getFocusedRootTaskInfo();
+            if (top != null && top.topActivity != null) {
+                final String pkg = top.topActivity.getPackageName();
+                if (pkg != null && !"com.android.systemui".equals(pkg)) {
+                    android.app.ActivityManager.getService().forceStopPackage(pkg, top.userId);
+                }
+            }
+        } catch (RemoteException ignored) {
+        }
     }
 }

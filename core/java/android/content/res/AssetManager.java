@@ -291,9 +291,6 @@ public final class AssetManager implements AutoCloseable {
             for (String idmapPath : systemIdmapPaths) {
                 apkAssets.add(ApkAssets.loadOverlayFromPath(idmapPath, ApkAssets.PROPERTY_SYSTEM));
             }
-            apkAssets.add(ApkAssets.loadFromPath(
-                    "/system/framework/org.lineageos.platform-res.apk",
-                    ApkAssets.PROPERTY_SYSTEM));
 
             sSystemApkAssetsSet = new ArraySet<>(apkAssets);
             sSystemApkAssets = apkAssets.toArray(new ApkAssets[0]);
