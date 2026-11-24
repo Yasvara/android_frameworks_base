@@ -21,6 +21,8 @@ import android.os.Process;
 import android.os.SystemProperties;
 import android.os.UserManager;
 import android.provider.Settings;
+import android.system.Os;
+import android.system.StructUtsname;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -461,8 +463,9 @@ public final class YasvaraSpoofEngine {
 
     /**
      * Purges DroidGuard's SQLite token cache (dg.db) and VM bytecode cache (app_dgp)
-     * inside com.google.android.gms.unstable whenever any attestation-relevant state
-     * (PIF toggle/profile, TrickyStore toggle, patch override, or keybox) changes.
+     * inside com.google.android.gms.unstable (and Play Integrity caches in GMS/Vending)
+     * whenever any attestation-relevant state (PIF toggle/profile, TrickyStore toggle,
+     * patch override, keybox, measured boot digest, or kernel release) changes.
      */
     private static void maybePurgeDroidGuard(
             Context context, boolean pifEnabled, Map<String, String> pif) {
@@ -478,22 +481,12 @@ public final class YasvaraSpoofEngine {
             String tsTargets = Settings.Secure.getString(cr, YasvaraTrickyStore.KEY_TARGETS);
             String patchOverride = Settings.Secure.getString(cr, KEY_PATCH_OVERRIDE);
             String kbStamp = Settings.Secure.getString(cr, KEY_KEYBOX_STAMP);
+            String bootDigest = readCanonicalBootDigest();
+            String kernelRelease = readKernelRelease();
 
-            StringBuilder state = new StringBuilder(320);
-            state.append("pif=").append(pifEnabled ? "1" : "0")
-                 .append("|fp=").append(pif != null ? pif.getOrDefault("FINGERPRINT", "") : "")
-                 .append("|sp=").append(pif != null ? pif.getOrDefault("SECURITY_PATCH", "") : "")
-                 .append("|id=").append(pif != null ? pif.getOrDefault("ID", "") : "")
-                 .append("|rel=").append(pif != null ? pif.getOrDefault("RELEASE", "") : "")
-                 .append("|brand=").append(pif != null ? pif.getOrDefault("BRAND", "") : "")
-                 .append("|dev=").append(pif != null ? pif.getOrDefault("DEVICE", "") : "")
-                 .append("|model=").append(pif != null ? pif.getOrDefault("MODEL", "") : "")
-                 .append("|sdk=").append(pif != null ? pif.getOrDefault("DEVICE_INITIAL_SDK_INT", "") : "")
-                 .append("|ts=").append(tsEnabled)
-                 .append("|targets=").append(tsTargets != null ? tsTargets : "")
-                 .append("|po=").append(patchOverride != null ? patchOverride : "")
-                 .append("|kb=").append(kbStamp != null ? kbStamp : "");
-            String currentStamp = Integer.toHexString(state.toString().hashCode());
+            String currentStamp = computeDroidGuardStamp(
+                    pifEnabled, pif, tsEnabled, tsTargets, patchOverride,
+                    kbStamp, bootDigest, kernelRelease);
 
             File dataDir = context.getDataDir();
             if (dataDir == null) return;
@@ -533,6 +526,52 @@ public final class YasvaraSpoofEngine {
         }
     }
 
+    static String computeDroidGuardStamp(
+            boolean pifEnabled,
+            Map<String, String> pif,
+            int tsEnabled,
+            String tsTargets,
+            String patchOverride,
+            String kbStamp,
+            String bootDigest,
+            String kernelRelease) {
+        StringBuilder state = new StringBuilder(448);
+        state.append("pif=").append(pifEnabled ? "1" : "0")
+             .append("|fp=").append(pif != null ? pif.getOrDefault("FINGERPRINT", "") : "")
+             .append("|sp=").append(pif != null ? pif.getOrDefault("SECURITY_PATCH", "") : "")
+             .append("|id=").append(pif != null ? pif.getOrDefault("ID", "") : "")
+             .append("|rel=").append(pif != null ? pif.getOrDefault("RELEASE", "") : "")
+             .append("|brand=").append(pif != null ? pif.getOrDefault("BRAND", "") : "")
+             .append("|dev=").append(pif != null ? pif.getOrDefault("DEVICE", "") : "")
+             .append("|model=").append(pif != null ? pif.getOrDefault("MODEL", "") : "")
+             .append("|sdk=").append(pif != null ? pif.getOrDefault("DEVICE_INITIAL_SDK_INT", "") : "")
+             .append("|ts=").append(tsEnabled)
+             .append("|targets=").append(tsTargets != null ? tsTargets : "")
+             .append("|po=").append(patchOverride != null ? patchOverride : "")
+             .append("|kb=").append(kbStamp != null ? kbStamp : "")
+             .append("|bd=").append(bootDigest != null ? bootDigest : "")
+             .append("|kr=").append(kernelRelease != null ? kernelRelease : "");
+        return Integer.toHexString(state.toString().hashCode());
+    }
+
+    private static String readCanonicalBootDigest() {
+        try {
+            String raw = SystemProperties.get(YasvaraBootDigest.PROPERTY, "").trim();
+            return YasvaraBootDigest.decodeCanonical(raw) != null ? raw : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static String readKernelRelease() {
+        try {
+            StructUtsname uts = Os.uname();
+            return (uts != null && uts.release != null) ? uts.release.trim() : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     static void purgeIntegrityDirs(File rootDir) {
         if (rootDir == null || !rootDir.exists()) return;
         deleteDirRecursive(new File(rootDir, "app_dgp"));
@@ -555,6 +594,7 @@ public final class YasvaraSpoofEngine {
             if (name.contains("droidguard") || name.contains("play_integrity")
                     || name.contains("express_integrity") || name.contains("device_integrity")
                     || name.contains("gmscompliance") || name.startsWith("compliance_product_id")
+                    || name.startsWith("integrity_service_sharedprefs")
                     || "dg_shared_preferences.xml".equals(name)) {
                 child.delete();
             }
