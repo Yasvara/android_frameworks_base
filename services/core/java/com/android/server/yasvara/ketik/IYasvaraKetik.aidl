@@ -31,4 +31,11 @@ interface IYasvaraKetik {
 
     /** Forgets the last revert once the owner has seen it. */
     void clearLastRevert();
+
+    /**
+     * Safe runtime health snapshot of Gboard (version, active GenAI handlers, whitelisted
+     * component readiness tags, loaded feature modules, total registered flag count). Never
+     * returns keyboard text or account identifiers.
+     */
+    Bundle readRuntimeHealth();
 }

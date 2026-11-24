@@ -12,6 +12,8 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.os.Binder;
 import android.os.Bundle;
 import android.os.IBinder;
@@ -82,6 +84,24 @@ public final class YasvaraKetikService extends IYasvaraKetik.Stub {
                     + "(?:, ((?:DEFAULT|SYSTEM_SETTING|PHENOTYPE|MANAGED_CONFIG|OEM|OVERRIDE"
                     + "|HERMETRIC_OVERRIDE)=.*))?\\}\\s*$");
     private static final Pattern SOURCE = Pattern.compile("(?:^|, )([A-Z_]+)=");
+    /** Whitelisted Gboard runtime component tags safe to expose to Laras (never user text). */
+    private static final Set<String> SAFE_TAGS = Set.of(
+            "AccessPointsManager_Created",
+            "AdultAccount",
+            "AgeOfConsentAccount",
+            "CurrentHandlerModelProvisionedTag",
+            "CurrentHandlerModelReadyTag",
+            "HandlerEverProvisionedTag",
+            "HybridModelProvisionedTag",
+            "HybridModelReadyTag",
+            "MinorsCheckerPassedTag",
+            "OnDeviceModelProvisionedTag",
+            "OnDeviceModelReadyTag",
+            "ProofreadModelProvisionedTag",
+            "ProofreadModelReadyTag",
+            "UnsupervisedAccount");
+    private static final Pattern GENAI_HANDLER = Pattern.compile(
+            "\\[(ServerSideGenAi|OnDeviceGenAi|HybridGenAi)\\b");
     private static final long DUMP_TIMEOUT_MS = 8000;
 
     private static final int CRASH_STRIKES = 3;
@@ -183,6 +203,17 @@ public final class YasvaraKetikService extends IYasvaraKetik.Stub {
             UserState s = stateLocked(user);
             s.lastRevert = new ArrayList<>();
             writeLocked(user, s);
+        }
+    }
+
+    @Override
+    public Bundle readRuntimeHealth() {
+        enforce();
+        final long token = Binder.clearCallingIdentity();
+        try {
+            return readHealthBundle();
+        } finally {
+            Binder.restoreCallingIdentity(token);
         }
     }
 
@@ -358,6 +389,128 @@ public final class YasvaraKetikService extends IYasvaraKetik.Stub {
             }
         } catch (IOException e) {
             Slog.w(TAG, "Reading Gboard's flags stopped: " + e);
+        }
+    }
+
+    private Bundle readHealthBundle() {
+        final Bundle out = new Bundle();
+        try {
+            final PackageInfo pi = mContext.getPackageManager().getPackageInfo(PKG, 0);
+            out.putString("versionName", pi.versionName != null ? pi.versionName : "");
+            out.putLong("versionCode", pi.getLongVersionCode());
+        } catch (PackageManager.NameNotFoundException ignored) {
+            out.putString("versionName", "");
+            out.putLong("versionCode", 0L);
+        }
+
+        final IBinder am = ServiceManager.getService(Context.ACTIVITY_SERVICE);
+        if (am == null) return out;
+
+        final TreeSet<String> tags = new TreeSet<>();
+        final TreeSet<String> handlers = new TreeSet<>();
+        final TreeSet<String> modules = new TreeSet<>();
+        final int[] flagCount = {0};
+        final boolean[] hasRestrictions = {false};
+
+        ParcelFileDescriptor read = null;
+        ParcelFileDescriptor write = null;
+        try {
+            final ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+            read = pipe[0];
+            write = pipe[1];
+            final ParcelFileDescriptor source = read;
+            final Thread reader = new Thread(() -> parseHealth(
+                    source, tags, handlers, modules, flagCount, hasRestrictions), TAG + "Health");
+            reader.start();
+            am.dump(write.getFileDescriptor(), new String[] {"service", IME.flattenToString()});
+            write.close();
+            write = null;
+            reader.join(DUMP_TIMEOUT_MS);
+            if (reader.isAlive()) {
+                reader.interrupt();
+                return out;
+            }
+        } catch (IOException | android.os.RemoteException | InterruptedException e) {
+            Slog.w(TAG, "Could not read Gboard health: " + e);
+        } finally {
+            closeQuietly(write);
+            closeQuietly(read);
+        }
+
+        synchronized (tags) {
+            out.putBoolean("running", flagCount[0] > 0);
+            out.putBoolean("hasRestrictions", hasRestrictions[0]);
+            out.putInt("totalFlags", flagCount[0]);
+            out.putStringArrayList("tags", new ArrayList<>(tags));
+            out.putStringArrayList("handlers", new ArrayList<>(handlers));
+            out.putStringArrayList("modules", new ArrayList<>(modules));
+        }
+        return out;
+    }
+
+    private static void parseHealth(
+            ParcelFileDescriptor fd,
+            TreeSet<String> tags,
+            TreeSet<String> handlers,
+            TreeSet<String> modules,
+            int[] flagCount,
+            boolean[] hasRestrictions) {
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                new FileInputStream(fd.getFileDescriptor()), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.indexOf("{type=") >= 0) {
+                    if (FLAG_LINE.matcher(line).matches()) {
+                        synchronized (tags) {
+                            flagCount[0]++;
+                        }
+                    }
+                    continue;
+                }
+                final String trimmed = line.trim();
+                if (trimmed.isEmpty()) continue;
+                if (SAFE_TAGS.contains(trimmed)) {
+                    synchronized (tags) {
+                        tags.add(trimmed);
+                    }
+                    continue;
+                }
+                if ("hasRestrictions: true".equals(trimmed)) {
+                    synchronized (tags) {
+                        hasRestrictions[0] = true;
+                    }
+                    continue;
+                }
+                final Matcher hm = GENAI_HANDLER.matcher(trimmed);
+                if (hm.find()) {
+                    synchronized (tags) {
+                        handlers.add(hm.group(1));
+                    }
+                    continue;
+                }
+                if (trimmed.contains("tag=JarvisAccessPointProviderModule,")
+                        && !trimmed.contains("instance=null")) {
+                    synchronized (tags) {
+                        modules.add("JarvisAccessPoint");
+                    }
+                } else if (trimmed.contains("tag=JarvisExtension,")
+                        && !trimmed.contains("instance=null")) {
+                    synchronized (tags) {
+                        modules.add("JarvisExtension");
+                    }
+                } else if (trimmed.contains("IJarvisPromptExtension")
+                        && trimmed.contains("instance=") && !trimmed.contains("instance=null")) {
+                    synchronized (tags) {
+                        modules.add("JarvisPromptV2");
+                    }
+                } else if (trimmed.contains("AgenticDictationOnboardingState")) {
+                    synchronized (tags) {
+                        modules.add("AgenticDictation");
+                    }
+                }
+            }
+        } catch (IOException e) {
+            Slog.w(TAG, "Reading Gboard health stopped: " + e);
         }
     }
 
