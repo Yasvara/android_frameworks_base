@@ -29,7 +29,7 @@ final class ManualSunlightController implements SensorEventListener {
     private final Handler mHandler;
     private final SensorManager mSensorManager;
     private final Sensor mLightSensor;
-    private final float mMinLux;
+    private float mMinLux;
     private final Runnable mOnChange;
 
     private final long[] mTimes = new long[MAX_SAMPLES];
@@ -64,6 +64,11 @@ final class ManualSunlightController implements SensorEventListener {
             mSensorManager.unregisterListener(this);
             mActive = false;
         }
+    }
+
+    /** Takes effect on the next sample, with the usual exit hysteresis. */
+    void setMinLux(float minLux) {
+        mMinLux = minLux;
     }
 
     boolean isActive() {

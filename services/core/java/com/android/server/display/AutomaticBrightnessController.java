@@ -168,6 +168,13 @@ public class AutomaticBrightnessController {
     private final int mAmbientLightHorizonLong;
     private final int mAmbientLightHorizonShort;
 
+    // User debounce, DEBOUNCE_DEFAULT when unset. The ring buffer clamps its oldest sample to the
+    // long horizon, so a debounce at or above it would never fire; the horizon stretches to fit.
+    private long mBrighteningLightDebounceOverride = BrightnessTuning.DEBOUNCE_DEFAULT;
+    private long mDarkeningLightDebounceOverride = BrightnessTuning.DEBOUNCE_DEFAULT;
+    private int mEffectiveAmbientLightHorizonLong;
+    private static final int DEBOUNCE_HORIZON_MARGIN_MILLIS = 500;
+
     // The intercept used for the weighting calculation. This is used in order to keep all possible
     // weighting values positive.
     private final int mWeightingIntercept;
@@ -360,6 +367,7 @@ public class AutomaticBrightnessController {
         mDarkeningLightDebounceConfigIdle = darkeningLightDebounceConfigIdle;
         mResetAmbientLuxAfterWarmUpConfig = resetAmbientLuxAfterWarmUpConfig;
         mAmbientLightHorizonLong = ambientLightHorizonLong;
+        mEffectiveAmbientLightHorizonLong = ambientLightHorizonLong;
         mAmbientLightHorizonShort = ambientLightHorizonShort;
         mWeightingIntercept = ambientLightHorizonLong;
         mAmbientBrightnessThresholds = ambientBrightnessThresholds;
@@ -675,6 +683,9 @@ public class AutomaticBrightnessController {
         ipw.println("mResetAmbientLuxAfterWarmUpConfig=" + mResetAmbientLuxAfterWarmUpConfig);
         ipw.println("mAmbientLightHorizonLong=" + mAmbientLightHorizonLong);
         ipw.println("mAmbientLightHorizonShort=" + mAmbientLightHorizonShort);
+        ipw.println("mLightDebounceOverride=" + mBrighteningLightDebounceOverride + "/"
+                + mDarkeningLightDebounceOverride);
+        ipw.println("mEffectiveAmbientLightHorizonLong=" + mEffectiveAmbientLightHorizonLong);
         ipw.println("mWeightingIntercept=" + mWeightingIntercept);
 
         pw.println();
@@ -796,7 +807,7 @@ public class AutomaticBrightnessController {
 
     private void applyLightSensorMeasurement(long time, float lux) {
         mRecentLightSamples++;
-        mAmbientLightRingBuffer.prune(time - mAmbientLightHorizonLong);
+        mAmbientLightRingBuffer.prune(time - mEffectiveAmbientLightHorizonLong);
         mAmbientLightRingBuffer.push(time, lux);
         // Remember this sample value.
         mLastObservedLux = lux;
@@ -923,8 +934,7 @@ public class AutomaticBrightnessController {
             }
             earliestValidTime = mAmbientLightRingBuffer.getTime(i);
         }
-        return earliestValidTime + (isInIdleMode()
-                ? mBrighteningLightDebounceConfigIdle : mBrighteningLightDebounceConfig);
+        return earliestValidTime + getBrighteningLightDebounce();
     }
 
     private long nextAmbientLightDarkeningTransition(long time) {
@@ -936,8 +946,33 @@ public class AutomaticBrightnessController {
             }
             earliestValidTime = mAmbientLightRingBuffer.getTime(i);
         }
-        return earliestValidTime + (isInIdleMode()
-                ? mDarkeningLightDebounceConfigIdle : mDarkeningLightDebounceConfig);
+        return earliestValidTime + getDarkeningLightDebounce();
+    }
+
+    private long getBrighteningLightDebounce() {
+        if (mBrighteningLightDebounceOverride >= 0) {
+            return mBrighteningLightDebounceOverride;
+        }
+        return isInIdleMode() ? mBrighteningLightDebounceConfigIdle
+                : mBrighteningLightDebounceConfig;
+    }
+
+    private long getDarkeningLightDebounce() {
+        if (mDarkeningLightDebounceOverride >= 0) {
+            return mDarkeningLightDebounceOverride;
+        }
+        return isInIdleMode() ? mDarkeningLightDebounceConfigIdle : mDarkeningLightDebounceConfig;
+    }
+
+    /** Overrides both debounces in every mode; DEBOUNCE_DEFAULT restores the config. */
+    void setLightDebounceOverride(long brightening, long darkening) {
+        mBrighteningLightDebounceOverride = brightening;
+        mDarkeningLightDebounceOverride = darkening;
+        final long longest = Math.max(getBrighteningLightDebounce(), getDarkeningLightDebounce());
+        mEffectiveAmbientLightHorizonLong = brightening < 0 && darkening < 0
+                ? mAmbientLightHorizonLong
+                : (int) Math.max(mAmbientLightHorizonLong,
+                        longest + DEBOUNCE_HORIZON_MARGIN_MILLIS);
     }
 
     // A much brighter reading right after the sensor starts is real: follow it without waiting.
@@ -965,7 +1000,7 @@ public class AutomaticBrightnessController {
 
     private void updateAmbientLux() {
         long time = mClock.getSensorEventScaleTime();
-        mAmbientLightRingBuffer.prune(time - mAmbientLightHorizonLong);
+        mAmbientLightRingBuffer.prune(time - mEffectiveAmbientLightHorizonLong);
         updateAmbientLux(time);
     }
 
@@ -1012,7 +1047,7 @@ public class AutomaticBrightnessController {
         // proposed ambient light value since the slow value might be sufficiently far enough away
         // from the fast value to cause a recalculation while its actually just converging on
         // the fast value still.
-        mSlowAmbientLux = calculateAmbientLux(time, mAmbientLightHorizonLong);
+        mSlowAmbientLux = calculateAmbientLux(time, mEffectiveAmbientLightHorizonLong);
         mFastAmbientLux = calculateAmbientLux(time, mAmbientLightHorizonShort);
 
         if ((mSlowAmbientLux >= mAmbientBrighteningThreshold

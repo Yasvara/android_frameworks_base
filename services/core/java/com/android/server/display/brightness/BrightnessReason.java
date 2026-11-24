@@ -56,9 +56,10 @@ public final class BrightnessReason {
     public static final int MODIFIER_STYLUS_UNDER_USE = 0x20;
     public static final int MODIFIER_SUNLIGHT = 0x40;
     public static final int MODIFIER_MAX_LUX = 0x80;
+    public static final int MODIFIER_LIMIT = 0x100;
     public static final int MODIFIER_MASK = MODIFIER_DIMMED | MODIFIER_LOW_POWER | MODIFIER_HDR
             | MODIFIER_THROTTLED | MODIFIER_MIN_LUX | MODIFIER_STYLUS_UNDER_USE | MODIFIER_SUNLIGHT
-            | MODIFIER_MAX_LUX;
+            | MODIFIER_MAX_LUX | MODIFIER_LIMIT;
 
     @IntDef(flag = true, prefix = {"MODIFIER_"}, value = {
             MODIFIER_NONE,
@@ -68,7 +69,9 @@ public final class BrightnessReason {
             MODIFIER_THROTTLED,
             MODIFIER_MIN_LUX,
             MODIFIER_STYLUS_UNDER_USE,
-            MODIFIER_SUNLIGHT
+            MODIFIER_SUNLIGHT,
+            MODIFIER_MAX_LUX,
+            MODIFIER_LIMIT
     })
     @Retention(RetentionPolicy.SOURCE)
     public @interface Modifier {}
@@ -184,6 +187,9 @@ public final class BrightnessReason {
         }
         if ((mModifier & MODIFIER_MAX_LUX) != 0) {
             sb.append(" lux_upper_bound");
+        }
+        if ((mModifier & MODIFIER_LIMIT) != 0) {
+            sb.append(" limit");
         }
         int strlen = sb.length();
         if (sb.charAt(strlen - 1) == '[') {

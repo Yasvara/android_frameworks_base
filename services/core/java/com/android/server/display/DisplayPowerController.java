@@ -449,6 +449,9 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
     private ManualSunlightController mManualSunlightController;
     private boolean mManualSunlightApplied;
     private boolean mManualSunlightExiting;
+    private ThermalBrightnessGuard mThermalBrightnessGuard;
+    // Default display only; null means the build's tuning.
+    private BrightnessTuning mBrightnessTuning;
 
     // True if this DisplayPowerController has been stopped and should no longer be running.
     private boolean mStopped;
@@ -1031,6 +1034,18 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
         mContext.getContentResolver().registerContentObserver(
                 Settings.System.getUriFor(Settings.System.SCREEN_BRIGHTNESS_FOR_ALS),
                 /* notifyForDescendants= */ false, mSettingsObserver, UserHandle.USER_ALL);
+        if (mDisplayId == Display.DEFAULT_DISPLAY) {
+            mContext.getContentResolver().registerContentObserver(
+                    Settings.Secure.getUriFor(ThermalBrightnessGuard.SETTING),
+                    /* notifyForDescendants= */ false, mSettingsObserver, UserHandle.USER_ALL);
+            updateThermalBrightnessGuard();
+            for (String key : BrightnessTuning.KEYS) {
+                mContext.getContentResolver().registerContentObserver(
+                        Settings.Secure.getUriFor(key),
+                        /* notifyForDescendants= */ false, mSettingsObserver, UserHandle.USER_ALL);
+            }
+            updateBrightnessTuning();
+        }
         mContext.getContentResolver().registerContentObserver(
                 Settings.System.getUriFor(YasvaraSettings.System.AUTO_BRIGHTNESS_ONE_SHOT),
                 false /*notifyForDescendants*/, mSettingsObserver, UserHandle.USER_ALL);
@@ -1172,6 +1187,7 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
             mDisplayBrightnessController.setUpAutoBrightness(
                     mAutomaticBrightnessController, mSensorManager, mDisplayDeviceConfig, mHandler,
                     defaultModeBrightnessMapper, mIsEnabled, mLeadDisplayId);
+            applyLightDebounceTuning();
             mBrightnessEventRingBuffer =
                     new RingBuffer<>(BrightnessEvent.class, RINGBUFFER_MAX);
         } else {
@@ -1295,6 +1311,9 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
         mBrightnessClamperController.stop();
         mDisplayBrightnessReporter.stop();
         releaseManualSunlight();
+        if (mThermalBrightnessGuard != null) {
+            mThermalBrightnessGuard.setEnabled(false);
+        }
         mHandler.removeCallbacksAndMessages(null);
 
         // Release any outstanding wakelocks we're still holding because of pending messages.
@@ -1471,8 +1490,11 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
 
         boolean manualSunlight = false;
         if (updateManualSunlight(state, brightnessState)) {
-            final float sunlightBrightness = mAutomaticBrightnessController.getBrightnessForLux(
-                    mManualSunlightController.getLux());
+            final float sunlightBrightness = mBrightnessTuning != null
+                    && mBrightnessTuning.getSunMode() == BrightnessTuning.SUN_FIXED
+                    ? clampedState.getMaxBrightness()
+                    : mAutomaticBrightnessController.getBrightnessForLux(
+                            mManualSunlightController.getLux());
             if (sunlightBrightness > brightnessState) {
                 brightnessState = Math.min(sunlightBrightness, clampedState.getMaxBrightness());
                 mBrightnessReasonTemp.addModifier(BrightnessReason.MODIFIER_SUNLIGHT);
@@ -1492,6 +1514,28 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 slowChange = true;
             } else {
                 mManualSunlightExiting = false;
+            }
+        }
+
+        final boolean autoOrSunlight = manualSunlight
+                || mBrightnessReasonTemp.getReason() == BrightnessReason.REASON_AUTOMATIC;
+        if (mBrightnessTuning != null && mBrightnessTuning.hasLimits()
+                && state == Display.STATE_ON && autoOrSunlight) {
+            brightnessState = applyBrightnessLimits(brightnessState, manualSunlight);
+        }
+
+        if (mThermalBrightnessGuard != null && state == Display.STATE_ON) {
+            final float capNits = mThermalBrightnessGuard.getMaxNits(
+                    getThermalGuardLux(manualSunlight));
+            final float capBacklight = Float.isNaN(capNits)
+                    ? Float.NaN : mDisplayDeviceConfig.getBacklightFromNits(capNits);
+            if (capBacklight >= 0f) {
+                final float cap = mDisplayDeviceConfig.getBrightnessFromBacklight(capBacklight);
+                if (brightnessState > cap) {
+                    brightnessState = cap;
+                    mBrightnessReasonTemp.addModifier(BrightnessReason.MODIFIER_THROTTLED);
+                    slowChange = true;
+                }
             }
         }
 
@@ -1634,6 +1678,10 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                     }
                     mPerceptualRampCurve.update(sdrAnimateValue,
                             mAutomaticBrightnessController.getLightSensorEnableTime());
+                    if (mBrightnessTuning != null) {
+                        mPerceptualRampCurve.setSpeed(mBrightnessTuning.getSpeedUp(),
+                                mBrightnessTuning.getSpeedDown());
+                    }
                 }
                 mScreenBrightnessRampAnimator.setRateCurve(
                         perceptualRamp ? mPerceptualRampCurve : null);
@@ -2240,6 +2288,8 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 | BrightnessReason.MODIFIER_LOW_POWER | BrightnessReason.MODIFIER_THROTTLED;
         final boolean enabled = hbm != null && mLightSensor != null
                 && mAutomaticBrightnessController != null && state == Display.STATE_ON
+                && (mBrightnessTuning == null
+                        || mBrightnessTuning.getSunMode() != BrightnessTuning.SUN_OFF)
                 && mBrightnessReasonTemp.getReason() == BrightnessReason.REASON_MANUAL
                 && (mBrightnessReasonTemp.getModifier() & blockingModifiers) == 0
                 && brightness >= mBrightnessRangeController.getCurrentBrightnessMax()
@@ -2251,8 +2301,88 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
         if (mManualSunlightController == null) {
             return false;
         }
+        if (mBrightnessTuning != null) {
+            mManualSunlightController.setMinLux(mBrightnessTuning.getSunLux(hbm.minimumLux));
+        }
         mManualSunlightController.setEnabled(enabled);
         return mManualSunlightController.isActive();
+    }
+
+    private float getThermalGuardLux(boolean manualSunlight) {
+        if (manualSunlight) {
+            return mManualSunlightController.getLux();
+        }
+        if (mBrightnessReasonTemp.getReason() == BrightnessReason.REASON_AUTOMATIC
+                && mAutomaticBrightnessController != null) {
+            return mAutomaticBrightnessController.getAmbientLux();
+        }
+        // Unknown lux takes the strictest band, as the vendor does.
+        return 0f;
+    }
+
+    // Auto floor and ceiling. Sunlight is only capped; dim and low power may go below the floor.
+    private float applyBrightnessLimits(float brightness, boolean manualSunlight) {
+        final float ceiling = nitsToBrightness(mBrightnessTuning.getCeilingNits());
+        if (!Float.isNaN(ceiling) && brightness > ceiling) {
+            mBrightnessReasonTemp.addModifier(BrightnessReason.MODIFIER_LIMIT);
+            return ceiling;
+        }
+        final int dimming = BrightnessReason.MODIFIER_DIMMED | BrightnessReason.MODIFIER_LOW_POWER;
+        if (manualSunlight || (mBrightnessReasonTemp.getModifier() & dimming) != 0) {
+            return brightness;
+        }
+        final float floor = nitsToBrightness(mBrightnessTuning.getFloorNits());
+        if (!Float.isNaN(floor) && brightness < floor) {
+            mBrightnessReasonTemp.addModifier(BrightnessReason.MODIFIER_LIMIT);
+            return floor;
+        }
+        return brightness;
+    }
+
+    private float nitsToBrightness(float nits) {
+        if (Float.isNaN(nits)) {
+            return Float.NaN;
+        }
+        final float backlight = mDisplayDeviceConfig.getBacklightFromNits(nits);
+        return backlight < 0f
+                ? Float.NaN : mDisplayDeviceConfig.getBrightnessFromBacklight(backlight);
+    }
+
+    private void updateBrightnessTuning() {
+        if (mBrightnessTuning == null) {
+            mBrightnessTuning = new BrightnessTuning(
+                    mDisplayDeviceConfig.getNitsFromBacklight(
+                            mDisplayDeviceConfig.getBacklightFromBrightness(
+                                    PowerManager.BRIGHTNESS_MIN)),
+                    mDisplayDeviceConfig.getNitsFromBacklight(
+                            mDisplayDeviceConfig.getBacklightFromBrightness(
+                                    PowerManager.BRIGHTNESS_MAX)));
+        }
+        if (mBrightnessTuning.reload(mContext.getContentResolver())) {
+            applyLightDebounceTuning();
+        }
+    }
+
+    private void applyLightDebounceTuning() {
+        if (mBrightnessTuning != null && mAutomaticBrightnessController != null) {
+            mAutomaticBrightnessController.setLightDebounceOverride(
+                    mBrightnessTuning.getDebounceUp(), mBrightnessTuning.getDebounceDown());
+        }
+    }
+
+    private void updateThermalBrightnessGuard() {
+        final boolean enabled = Settings.Secure.getIntForUser(mContext.getContentResolver(),
+                ThermalBrightnessGuard.SETTING, 0, UserHandle.USER_CURRENT) != 0;
+        if (enabled && mThermalBrightnessGuard == null) {
+            mThermalBrightnessGuard = new ThermalBrightnessGuard(mHandler,
+                    this::sendUpdatePowerState);
+        }
+        if (mThermalBrightnessGuard != null) {
+            mThermalBrightnessGuard.setEnabled(enabled);
+            if (!enabled) {
+                mThermalBrightnessGuard = null;
+            }
+        }
     }
 
     private void releaseManualSunlight() {
@@ -2463,6 +2593,10 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
     }
 
     private void handleSettingsChange() {
+        if (mDisplayId == Display.DEFAULT_DISPLAY) {
+            updateThermalBrightnessGuard();
+            updateBrightnessTuning();
+        }
         mDisplayBrightnessController.handleSettingsChange();
         mAutomaticBrightnessStrategy.updatePendingAutoBrightnessAdjustments();
         mAutomaticBrightnessStrategy.setAutoBrightnessOneShotEnabled(
@@ -2721,6 +2855,12 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
 
         if (mManualSunlightController != null) {
             mManualSunlightController.dump(pw);
+        }
+        if (mThermalBrightnessGuard != null) {
+            mThermalBrightnessGuard.dump(pw);
+        }
+        if (mBrightnessTuning != null) {
+            mBrightnessTuning.dump(pw);
         }
 
         if (mDisplayOffloadSession != null) {

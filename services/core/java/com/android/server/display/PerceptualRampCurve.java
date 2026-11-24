@@ -58,6 +58,8 @@ final class PerceptualRampCurve implements RampAnimator.RateCurve {
     private final float mTransitionNits;
     private final float mMaxNits;
 
+    private float mSpeedUp = 1f;
+    private float mSpeedDown = 1f;
     private float mAutoBrightness;
     private long mSensorEnableTime;
     private boolean mFast;
@@ -70,6 +72,12 @@ final class PerceptualRampCurve implements RampAnimator.RateCurve {
         mTransitionBrightness = hbm != null ? hbm.transitionPoint : 1f;
         mTransitionNits = config.getNitsFromBacklight(mTransitionBrightness);
         mMaxNits = config.getNitsFromBacklight(1f);
+    }
+
+    /** Scales the brightening and darkening rates; the post-start fast ramp keeps its pace. */
+    void setSpeed(float up, float down) {
+        mSpeedUp = up;
+        mSpeedDown = down;
     }
 
     /** Reports the latest auto-brightness target and when the light sensor last started. */
@@ -88,8 +96,8 @@ final class PerceptualRampCurve implements RampAnimator.RateCurve {
                     : (float) Math.abs(Math.log(target / start) / FAST_SECONDS * current);
         } else {
             rate = target > current
-                    ? getBrighteningRate(start, current, target)
-                    : getDarkeningRate(current);
+                    ? getBrighteningRate(start, current, target) * mSpeedUp
+                    : getDarkeningRate(current) * mSpeedDown;
         }
         return Float.isFinite(rate) ? Math.max(rate, MIN_RATE) : MIN_RATE;
     }
