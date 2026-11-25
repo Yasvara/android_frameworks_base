@@ -393,20 +393,25 @@ class AppCompatSizeCompatModePolicy {
         }
         final int[] v = new int[2];
         LayangCore.getVirtualSize(mActivityRecord, v);
+        final Configuration displayConfig = dc.getConfiguration();
+        final android.app.yasvara.LayangTaskState layangState = LayangCore.getState(mActivityRecord);
+        final int customDpi = layangState != null ? layangState.getDensityDpi() : 0;
+        final int effectiveDpi = customDpi > 0 ? customDpi : displayConfig.densityDpi;
         if (mAppCompatDisplayInsets != null) {
-            if (mAppCompatDisplayInsets.isLayang(v[0], v[1])) {
+            if (mAppCompatDisplayInsets.isLayang(v[0], v[1])
+                    && mActivityRecord.getRequestedOverrideConfiguration().densityDpi
+                            == effectiveDpi) {
                 return;
             }
             clearSizeCompatModeAttributes();
             clearOverrideConfiguration();
         }
         final Configuration overrideConfig = mActivityRecord.getRequestedOverrideConfiguration();
-        final Configuration displayConfig = dc.getConfiguration();
         // Same fields as updateAppCompatDisplayInsets, but taken from the display so the app
         // sees exactly its fullscreen configuration and moving in or out of Layang never
         // relaunches it.
         overrideConfig.colorMode = displayConfig.colorMode;
-        overrideConfig.densityDpi = displayConfig.densityDpi;
+        overrideConfig.densityDpi = effectiveDpi;
         overrideConfig.touchscreen = displayConfig.touchscreen;
         overrideConfig.navigation = displayConfig.navigation;
         overrideConfig.keyboard = displayConfig.keyboard;
@@ -417,10 +422,10 @@ class AppCompatSizeCompatModePolicy {
         // sees a small screen; some games refuse to start on one.
         overrideConfig.screenLayout = displayConfig.screenLayout;
         final int displayShort = Math.min(dc.mBaseDisplayWidth, dc.mBaseDisplayHeight);
-        overrideConfig.smallestScreenWidthDp = v[1] == displayShort
+        overrideConfig.smallestScreenWidthDp = v[1] == displayShort && customDpi <= 0
                 ? displayConfig.smallestScreenWidthDp
                 : (int) (v[1] * android.util.DisplayMetrics.DENSITY_DEFAULT
-                        / (float) displayConfig.densityDpi + 0.5f);
+                        / (float) effectiveDpi + 0.5f);
         mAppCompatDisplayInsets = new AppCompatDisplayInsets(dc, mActivityRecord, v[0], v[1]);
     }
 

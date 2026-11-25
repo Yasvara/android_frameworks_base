@@ -2493,6 +2493,11 @@ class Task extends TaskFragment {
     /** Computes bounds for {@link WindowConfiguration#WINDOWING_MODE_FREEFORM}. */
     private void computeFreeformBounds(@NonNull Rect outBounds,
             @NonNull Configuration newParentConfig) {
+        if (LayangCore.isLayang(this)) {
+            // Yasvara: Shell owns exact Layang placement (including above stable top when status
+            // bar is hidden in immersive games); do not push it down to stableBounds.top.
+            return;
+        }
         // by policy, make sure the window remains within parent somewhere
         final float density =
                 ((float) newParentConfig.densityDpi) / DisplayMetrics.DENSITY_DEFAULT;

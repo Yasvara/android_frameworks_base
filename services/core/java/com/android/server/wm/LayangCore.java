@@ -53,14 +53,43 @@ public final class LayangCore {
 
     /** Game packages per user, pushed by the service (Pentas list + rules). */
     private static final SparseArray<Set<String>> sGamePackages = new SparseArray<>();
+    /** Packages with RULE_ALWAYS enabled per user, pushed by the service. */
+    private static final SparseArray<Set<String>> sAlwaysPackages = new SparseArray<>();
+    /** Callback into YasvaraLayangService to build placement for RULE_ALWAYS without re-locking. */
+    public interface AlwaysLaunchResolver {
+        @Nullable
+        android.app.ActivityOptions resolve(@NonNull String pkg, int userId,
+                @NonNull android.content.pm.ActivityInfo ai, int displayW, int displayH,
+                int densityDpi, int topInsetPx);
+    }
+    @Nullable
+    private static AlwaysLaunchResolver sAlwaysResolver;
+    /** Root task currently inside WindowOrganizerController.applyChanges entering Layang. */
+    @Nullable
+    private static Task sPreApplyingRoot;
+    /** Number of live root tasks with mLayangState != null (O(1) fast-path in rankTaskLayers). */
+    private static int sLayangTaskCount;
     /** Root task ids that currently get ACTIVITY_STATE_FLAG_LAYANG_TOP. */
     private static final ArraySet<Integer> sBoostedTasks = new ArraySet<>();
     private static final ArrayList<Task> sTmpBoost = new ArrayList<>();
+    private static final ArraySet<Integer> sNextBoost = new ArraySet<>();
+    private static final ArraySet<Integer> sChangedBoost = new ArraySet<>();
+    private static final boolean[] sAnyFloating = new boolean[1];
+    private static final Task[] sFullscreenTask = new Task[1];
 
     private LayangCore() {}
 
     static void init(@NonNull ActivityTaskManagerService atm) {
         sAtm = atm;
+    }
+
+    /** Marks tr's root task as entering Layang while WindowOrganizerController#applyChanges runs. */
+    static void beginEnterLocked(@NonNull Task tr) {
+        sPreApplyingRoot = tr.getRootTask();
+    }
+
+    static void endEnterLocked() {
+        sPreApplyingRoot = null;
     }
 
     // ------------------------------------------------------------------------------------
@@ -83,7 +112,16 @@ public final class LayangCore {
     }
 
     static boolean isLayang(@Nullable WindowContainer<?> wc) {
-        return getState(wc) != null;
+        if (wc == null) {
+            return false;
+        }
+        final Task task = wc.asTask() != null ? wc.asTask()
+                : wc.asActivityRecord() != null ? wc.asActivityRecord().getTask() : null;
+        if (task == null) {
+            return false;
+        }
+        final Task root = task.getRootTask();
+        return root != null && (root.mLayangState != null || root == sPreApplyingRoot);
     }
 
     /**
@@ -144,6 +182,11 @@ public final class LayangCore {
             return 0;
         }
         root.mLayangState = state;
+        if (old == null && state != null) {
+            sLayangTaskCount++;
+        } else if (old != null && state == null) {
+            sLayangTaskCount = Math.max(0, sLayangTaskCount - 1);
+        }
         int effects = WindowOrganizerController.TRANSACT_EFFECTS_CLIENT_CONFIG;
 
         if (state != null && root.getWindowingMode() != WINDOWING_MODE_FREEFORM) {
@@ -163,8 +206,8 @@ public final class LayangCore {
             root.getDisplayContent().getInputMonitor().updateInputWindowsLw(true /* force */);
         }
 
-        // Only a reflow window lowers its density; a scaled one keeps the display's, so it is
-        // never relaunched for a density change.
+        // Only a reflow window lowers its density at task level; a scaled one keeps the display's
+        // (optional resolution-scale density is applied in AppCompatSizeCompatModePolicy).
         final int density = state != null && state.hasFlag(LayangTaskState.FLAG_REFLOW)
                 ? state.getDensityDpi() : 0;
         final int wantDensity = density > 0 ? density : DENSITY_DPI_UNDEFINED;
@@ -179,7 +222,8 @@ public final class LayangCore {
         // display insets on entry and drops them when the task leaves Layang (§4.1).
         final boolean scaledChanged = isScaled(old) != isScaled(state)
                 || (old != null && state != null && (old.getVirtualLong() != state.getVirtualLong()
-                        || old.getVirtualShort() != state.getVirtualShort()));
+                        || old.getVirtualShort() != state.getVirtualShort()
+                        || old.getDensityDpi() != state.getDensityDpi()));
         if (scaledChanged) {
             root.forAllActivities(ar -> {
                 ar.mAppCompatController.getSizeCompatModePolicy().dropLayangDisplayInsets();
@@ -215,20 +259,163 @@ public final class LayangCore {
         return s != null && !s.hasFlag(LayangTaskState.FLAG_REFLOW);
     }
 
+    /**
+     * Resolves implicit Layang launches (lock held):
+     * 1. Trampoline/splash inheritance: a game splash activity inside Layang launching the real
+     *    game activity in a new task (singleTask/singleInstance/NEW_TASK) keeps floating.
+     * 2. RULE_ALWAYS: apps marked "Always open floating" launched from Home/Launcher.
+     */
+    @Nullable
+    static android.app.ActivityOptions maybeResolveLayangOptionsLocked(
+            @NonNull ActivityRecord r, @Nullable ActivityRecord source,
+            @Nullable android.app.ActivityOptions options, @Nullable Task targetTask) {
+        if (options != null && options.getLayangLaunch() != null) {
+            return options;
+        }
+        if (!r.isActivityTypeStandardOrUndefined() || r.isActivityTypeHomeOrRecents()
+                || r.getActivityType() == android.app.WindowConfiguration.ACTIVITY_TYPE_DREAM) {
+            return options;
+        }
+        // 1. Same-package or same-UID trampoline from an active Layang window.
+        if (source != null && isLayang(source)) {
+            final boolean sameApp = java.util.Objects.equals(r.packageName, source.packageName)
+                    || (r.getUid() > 0 && r.getUid() == source.getUid());
+            if (sameApp && (targetTask == null || !isLayang(targetTask))) {
+                final Task srcRoot = source.getRootTask();
+                final LayangTaskState srcState = srcRoot != null ? srcRoot.mLayangState : null;
+                if (srcState != null) {
+                    final android.app.ActivityOptions out = options != null
+                            ? options : android.app.ActivityOptions.makeBasic();
+                    out.setLaunchWindowingMode(WINDOWING_MODE_FREEFORM);
+                    final Rect srcBounds = srcRoot.getBounds();
+                    if (!srcBounds.isEmpty()) {
+                        out.setLaunchBounds(new Rect(srcBounds));
+                    }
+                    out.setLayangLaunch(srcState);
+                    return out;
+                }
+            }
+        }
+        // 2. RULE_ALWAYS: normal launch from Home/Launcher (or external caller with no source).
+        final Set<String> always = sAlwaysPackages.get(r.mUserId);
+        if (always != null && always.contains(r.packageName)
+                && (source == null || source.isActivityTypeHomeOrRecents())
+                && (targetTask == null || !isLayang(targetTask))) {
+            final AlwaysLaunchResolver resolver = sAlwaysResolver;
+            final DisplayContent dc = sAtm != null && sAtm.mRootWindowContainer != null
+                    ? sAtm.mRootWindowContainer.getDefaultDisplay() : null;
+            if (resolver != null && dc != null && r.info != null) {
+                final Rect db = dc.getBounds();
+                final int dpi = dc.getConfiguration().densityDpi;
+                final int topInset = computeTopInsetLocked(dc);
+                final android.app.ActivityOptions resolved = resolver.resolve(
+                        r.packageName, r.mUserId, r.info, db.width(), db.height(), dpi, topInset);
+                if (resolved != null && resolved.getLayangLaunch() != null) {
+                    if (options != null) {
+                        options.setLaunchWindowingMode(WINDOWING_MODE_FREEFORM);
+                        if (resolved.getLaunchBounds() != null) {
+                            options.setLaunchBounds(resolved.getLaunchBounds());
+                        }
+                        options.setLayangLaunch(resolved.getLayangLaunch());
+                        return options;
+                    }
+                    return resolved;
+                }
+            }
+        }
+        return options;
+    }
+
+    /**
+     * When a Layang task (e.g. a {@code singleInstance} launcher/extractor trampoline like
+     * Mobile Legends' {@code MobaGameMainActivityWithExtractor}) launches an opaque activity of
+     * the same app into a separate task, hand off Layang ownership cleanly instead of leaving
+     * the dead/black launcher task floating behind the real game window.
+     */
+    private static void handoffTrampolineLocked(@NonNull Task targetRoot,
+            @Nullable ActivityRecord source, @NonNull ActivityRecord r) {
+        if (source == null || !isLayang(source) || !r.occludesParent()) {
+            return;
+        }
+        final Task srcRoot = source.getRootTask();
+        if (srcRoot == null || srcRoot == targetRoot || srcRoot.mLayangState == null) {
+            return;
+        }
+        final boolean sameApp = java.util.Objects.equals(r.packageName, source.packageName)
+                || (r.getUid() > 0 && r.getUid() == source.getUid());
+        if (!sameApp) {
+            return;
+        }
+        if (srcRoot.mTransitionController.isCollecting()) {
+            srcRoot.mTransitionController.collect(srcRoot);
+        }
+        Slog.i(TAG, "trampoline handoff " + srcRoot + " -> " + targetRoot);
+        applyStateLocked(srcRoot, null);
+        if (srcRoot.getWindowingMode() != WINDOWING_MODE_FULLSCREEN) {
+            srcRoot.setRootTaskWindowingMode(WINDOWING_MODE_FULLSCREEN);
+        }
+        srcRoot.setBounds(null);
+        srcRoot.moveToBack("layang-trampoline-handoff", null);
+    }
+
+    /** Applies a Layang launch to an existing recycled task so non-resizable games stay floating. */
+    static void applyLaunchToTaskLocked(@NonNull Task task,
+            @Nullable android.app.ActivityOptions options,
+            @Nullable ActivityRecord source, @NonNull ActivityRecord r) {
+        final LayangTaskState state = options != null ? options.getLayangLaunch() : null;
+        if (state == null) {
+            return;
+        }
+        final Task root = task.getRootTask();
+        if (root == null) {
+            return;
+        }
+        handoffTrampolineLocked(root, source, r);
+        beginEnterLocked(root);
+        try {
+            if (root.getWindowingMode() != WINDOWING_MODE_FREEFORM) {
+                root.setRootTaskWindowingMode(WINDOWING_MODE_FREEFORM);
+            }
+            final Rect bounds = options.getLaunchBounds();
+            if (bounds != null && !bounds.isEmpty()) {
+                root.setBounds(bounds);
+            }
+        } finally {
+            endEnterLocked();
+        }
+        applyStateLocked(root, state);
+    }
+
     /** Applies a Layang launch from ActivityOptions once the started activity has its task. */
     static void onActivityStartedLocked(@NonNull ActivityRecord r,
-            @Nullable android.app.ActivityOptions options) {
+            @Nullable android.app.ActivityOptions options,
+            @Nullable ActivityRecord source) {
         final LayangTaskState state = options != null ? options.getLayangLaunch() : null;
         if (state == null) {
             return;
         }
         final Task task = r.getTask();
-        if (task == null || task.getRootTask() != task) {
-            Slog.w(TAG, "Layang launch of " + r + " is not a root task; ignored");
+        final Task root = task != null ? task.getRootTask() : null;
+        if (root == null) {
+            Slog.w(TAG, "Layang launch of " + r + " has no root task; ignored");
             r.mLayangLaunchPending = false;
             return;
         }
-        applyStateLocked(task, state);
+        applyLaunchToTaskLocked(root, options, source, r);
+    }
+
+    private static int computeTopInsetLocked(@NonNull DisplayContent dc) {
+        final int dpi = dc.getConfiguration().densityDpi;
+        final int pillH = android.app.yasvara.LayangGeometry.dpToPx(24, dpi);
+        final android.view.DisplayCutout cutout = dc.getDisplayInfo().displayCutout;
+        final int cutoutTop = cutout != null ? cutout.getSafeInsetTop() : 0;
+        final Rect stable = new Rect();
+        dc.getStableRect(stable);
+        // If status bar is hidden (immersive), cutout + pill is enough; otherwise stay below bar.
+        final WindowState statusBar = dc.getDisplayPolicy() != null
+                ? dc.getDisplayPolicy().getStatusBar() : null;
+        final boolean barVisible = statusBar != null && statusBar.isVisible();
+        return (barVisible ? Math.max(stable.top, cutoutTop) : cutoutTop) + pillH;
     }
 
     /** Windows of a ghost Layang task are not touchable (§4.5). */
@@ -272,9 +459,10 @@ public final class LayangCore {
         final Rect display = dc.getBounds();
         final int margin = android.app.yasvara.LayangGeometry.dpToPx(Layang.MARGIN_DP,
                 dc.getConfiguration().densityDpi);
-        // Turned, a window can be taller than the display: shrink it to fit (scale goes down).
+        final int topInset = computeTopInsetLocked(dc);
+        // Turned, a window can be taller than the display: shrink it to fit below pill/cutout.
         android.app.yasvara.LayangGeometry.fit(turned, display.width(), display.height(),
-                margin, 0);
+                margin, topInset);
         final WindowContainerToken token = root.mRemoteToken.toWindowContainerToken();
         final int taskId = root.mTaskId;
         sAtm.mH.post(() -> {
@@ -295,6 +483,8 @@ public final class LayangCore {
     /** Called when a root task is removed. */
     static void onTaskRemovedLocked(@NonNull Task task) {
         if (task.mLayangState != null) {
+            task.mLayangState = null;
+            sLayangTaskCount = Math.max(0, sLayangTaskCount - 1);
             sBoostedTasks.remove(task.mTaskId);
             notifyChangedLocked();
         }
@@ -330,14 +520,18 @@ public final class LayangCore {
      * at most {@link Layang#MAX_BOOSTED_GAMES} (§5.1).
      */
     static void updateBoostLocked(@NonNull RootWindowContainer root) {
+        // Zero-overhead fast path when idle (no Layang windows active and nothing boosted).
+        if (sLayangTaskCount == 0 && sBoostedTasks.isEmpty()) {
+            return;
+        }
         final DisplayContent dc = root.getDefaultDisplay();
         if (dc == null) {
             return;
         }
         final TaskDisplayArea tda = dc.getDefaultTaskDisplayArea();
         sTmpBoost.clear();
-        final boolean[] anyFloating = {false};
-        final Task[] fullscreen = {null};
+        sAnyFloating[0] = false;
+        sFullscreenTask[0] = null;
         tda.forAllRootTasks(t -> {
             if (!t.isVisibleRequested()) {
                 return;
@@ -345,41 +539,49 @@ public final class LayangCore {
             final LayangTaskState s = t.mLayangState;
             if (s != null) {
                 if (s.getMode() == LayangTaskState.MODE_FLOATING) {
-                    anyFloating[0] = true;
+                    sAnyFloating[0] = true;
                     if (isGameTask(t)) {
                         sTmpBoost.add(t);
                     }
                 }
-            } else if (fullscreen[0] == null && t.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
+            } else if (sFullscreenTask[0] == null
+                    && t.getWindowingMode() == WINDOWING_MODE_FULLSCREEN
                     && t.getActivityType() == ACTIVITY_TYPE_STANDARD) {
-                fullscreen[0] = t;
+                sFullscreenTask[0] = t;
             }
         }, true /* traverseTopToBottom */);
-        sTmpBoost.sort((a, b) -> Long.compare(b.lastActiveTime, a.lastActiveTime));
-        if (fullscreen[0] != null && isGameTask(fullscreen[0])) {
-            sTmpBoost.add(0, fullscreen[0]);
+        if (sTmpBoost.size() > 1) {
+            sTmpBoost.sort((a, b) -> Long.compare(b.lastActiveTime, a.lastActiveTime));
         }
-        final ArraySet<Integer> next = new ArraySet<>();
-        if (anyFloating[0]) {
-            for (int i = 0; i < sTmpBoost.size() && next.size() < Layang.MAX_BOOSTED_GAMES; i++) {
-                next.add(sTmpBoost.get(i).mTaskId);
+        if (sFullscreenTask[0] != null && isGameTask(sFullscreenTask[0])) {
+            sTmpBoost.add(0, sFullscreenTask[0]);
+        }
+        sNextBoost.clear();
+        if (sAnyFloating[0]) {
+            for (int i = 0; i < sTmpBoost.size() && sNextBoost.size() < Layang.MAX_BOOSTED_GAMES;
+                    i++) {
+                sNextBoost.add(sTmpBoost.get(i).mTaskId);
             }
         }
         sTmpBoost.clear();
-        if (next.equals(sBoostedTasks)) {
+        sFullscreenTask[0] = null;
+        if (sNextBoost.equals(sBoostedTasks)) {
+            sNextBoost.clear();
             return;
         }
-        final ArraySet<Integer> changed = new ArraySet<>(sBoostedTasks);
-        changed.addAll(next);
-        for (int i = 0; i < next.size(); i++) {
-            if (sBoostedTasks.contains(next.valueAt(i))) {
-                changed.remove(next.valueAt(i));
+        sChangedBoost.clear();
+        sChangedBoost.addAll(sBoostedTasks);
+        sChangedBoost.addAll(sNextBoost);
+        for (int i = 0; i < sNextBoost.size(); i++) {
+            if (sBoostedTasks.contains(sNextBoost.valueAt(i))) {
+                sChangedBoost.remove(sNextBoost.valueAt(i));
             }
         }
         sBoostedTasks.clear();
-        sBoostedTasks.addAll(next);
-        for (int i = 0; i < changed.size(); i++) {
-            final Task t = root.anyTaskForId(changed.valueAt(i));
+        sBoostedTasks.addAll(sNextBoost);
+        sNextBoost.clear();
+        for (int i = 0; i < sChangedBoost.size(); i++) {
+            final Task t = root.anyTaskForId(sChangedBoost.valueAt(i));
             if (t != null) {
                 t.forAllActivities(ar -> {
                     if (ar.hasProcess()) {
@@ -389,6 +591,7 @@ public final class LayangCore {
                 });
             }
         }
+        sChangedBoost.clear();
     }
 
     private static boolean isGameTask(@NonNull Task t) {
@@ -426,6 +629,22 @@ public final class LayangCore {
             if (sAtm.mRootWindowContainer != null) {
                 sAtm.mRootWindowContainer.invalidateTaskLayersAndUpdateOomAdjIfNeeded();
             }
+        }
+    }
+
+    public static void setAlwaysPackages(int userId, @NonNull Set<String> packages) {
+        synchronized (sAtm.mGlobalLock) {
+            if (packages.isEmpty()) {
+                sAlwaysPackages.remove(userId);
+            } else {
+                sAlwaysPackages.put(userId, new ArraySet<>(packages));
+            }
+        }
+    }
+
+    public static void setAlwaysLaunchResolver(@Nullable AlwaysLaunchResolver resolver) {
+        synchronized (sAtm.mGlobalLock) {
+            sAlwaysResolver = resolver;
         }
     }
 

@@ -1320,6 +1320,11 @@ class ActivityClientController extends IActivityClientController.Stub {
         }
         final int taskWindowingMode = targetTask.getWindowingMode();
         if (fullscreenRequest == FULLSCREEN_MODE_REQUEST_ENTER
+                && LayangCore.isLayang(targetTask)) {
+            // Yasvara: games/apps inside Layang cannot force themselves back to fullscreen.
+            return RESULT_FAILED_NOT_SUPPORTED;
+        }
+        if (fullscreenRequest == FULLSCREEN_MODE_REQUEST_ENTER
                 && taskWindowingMode == WINDOWING_MODE_FULLSCREEN) {
             // Requesting fullscreen enter but was already fullscreen, reject the request.
             return RESULT_FAILED_ALREADY_FULLY_EXPANDED;

@@ -50,4 +50,32 @@ interface IYasvaraRoot {
     /** Keys: idle_days (0 = never), notify_denied (0/1), log_full (0/1). */
     int getOption(String key);
     boolean setOption(String key, int value);
+
+    // ---- Akar Module Engine, Bootguard & Native Zygisk (SPEC-0049) ----
+
+    /** JSON array of installed Akar modules (Magisk/KSU/Zygisk). */
+    String listModulesJson();
+
+    /**
+     * Installs a module ZIP staged inside Laras's private cache directory
+     * (`akar_install/<fileName>`). Returns "<exitCode>\n<log>".
+     */
+    String installModuleFromCache(String fileName);
+
+    boolean setModuleEnabled(String id, boolean enabled);
+    boolean setModuleRemove(String id, boolean remove);
+
+    /** Runs a module's `action.sh` and returns "<exitCode>\n<output>". */
+    String runModuleAction(String id);
+
+    /** JSON Bootguard & Safe Mode status snapshot. */
+    String getBootguardStatusJson();
+    boolean clearSafeMode();
+
+    /** JSON Native Zygisk & TabirUnmount config snapshot. */
+    String getZygiskConfigJson();
+    boolean setZygiskConfigJson(String configJson);
+
+    /** Runs a WebUI X `ksu.exec()` command scoped to `moduleId`. Returns "<exitCode>\n<output>". */
+    String execModuleShell(String moduleId, String command);
 }

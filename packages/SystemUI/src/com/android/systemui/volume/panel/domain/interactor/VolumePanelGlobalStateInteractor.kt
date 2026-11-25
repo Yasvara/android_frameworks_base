@@ -19,15 +19,19 @@ package com.android.systemui.volume.panel.domain.interactor
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.deviceentry.domain.interactor.DeviceEntryInteractor
+import com.android.systemui.keyguard.domain.interactor.KeyguardInteractor
 import com.android.systemui.plugins.ActivityStarter
+import com.android.systemui.scene.shared.flag.SceneContainerFlag
 import com.android.systemui.volume.panel.data.repository.VolumePanelGlobalStateRepository
 import com.android.systemui.volume.panel.shared.model.VolumePanelGlobalState
 import javax.inject.Inject
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
@@ -39,6 +43,7 @@ class VolumePanelGlobalStateInteractor
 constructor(
     @param:Application private val coroutineScope: CoroutineScope,
     private val deviceEntryInteractor: DeviceEntryInteractor,
+    private val keyguardInteractor: KeyguardInteractor,
     private val repository: VolumePanelGlobalStateRepository,
     private val activityStarter: ActivityStarter,
 ) {
@@ -54,9 +59,9 @@ constructor(
             .stateIn(coroutineScope, SharingStarted.Eagerly, VolumePanelGlobalState(false))
 
     init {
-        deviceEntryInteractor.isDeviceEntered
-            .onEach { isDeviceEntered ->
-                if (!isDeviceEntered) {
+        deviceEntered()
+            .onEach { isEntered ->
+                if (!isEntered) {
                     setVisible(false)
                 }
             }
@@ -64,10 +69,31 @@ constructor(
     }
 
     fun setVisible(isVisible: Boolean) {
-        if (isVisible && !deviceEntryInteractor.isDeviceEntered.value) {
+        if (isVisible && !isDeviceEnteredNow()) {
             return
         }
         repository.updateVolumePanelState { it.copy(isVisible = isVisible) }
+    }
+
+    /**
+     * Scene container reports entry through [DeviceEntryInteractor], which only becomes true after
+     * [com.android.systemui.scene.shared.model.Scenes.Gone]. That transition never happens when the
+     * flag is off, so keyguard visibility is the equivalent synchronous gate.
+     */
+    private fun isDeviceEnteredNow(): Boolean {
+        return if (SceneContainerFlag.isEnabled) {
+            deviceEntryInteractor.isDeviceEntered.value
+        } else {
+            !keyguardInteractor.isKeyguardShowing.value
+        }
+    }
+
+    private fun deviceEntered(): Flow<Boolean> {
+        return if (SceneContainerFlag.isEnabled) {
+            deviceEntryInteractor.isDeviceEntered
+        } else {
+            keyguardInteractor.isKeyguardShowing.map { isShowing -> !isShowing }
+        }
     }
 
     private suspend fun awaitKeyguard() {

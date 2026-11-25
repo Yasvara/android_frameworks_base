@@ -90,6 +90,11 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
     // the daemon binds its own socket in the data directory (no /dev/socket entry)
     // and lives in /system/xbin, which only root and `shell` can search.
     private static final File DAEMON_SOCKET_FILE = new File(DIR, "run/ctl.sock");
+    private static final File MGMT_SOCKET_FILE = new File(DIR, "run/mgmt.sock");
+    private static final File MODULES_CONF_FILE = new File(DIR, "modules.conf");
+    private static final File ZYGISK_CONF_FILE = new File(DIR, "zygisk.conf");
+    private static final File UNMOUNT_CONF_FILE = new File(DIR, "unmount.conf");
+    private static final File BOOTGUARD_STATUS_FILE = new File(DIR, "bootguard.status");
     // Started and stopped from here, never by a property trigger: a property would name it to
     // every app. The daemon ships in exactly the builds that are not `user`.
     private static final String DAEMON_SERVICE = "yasvara_sessiond";
@@ -514,6 +519,338 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
             persistLocked();
             return true;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Akar Module Engine, Bootguard & Native Zygisk (SPEC-0049)
+    // ---------------------------------------------------------------------------------------
+
+    private static boolean isValidModuleId(String id) {
+        if (id == null || id.isEmpty() || id.length() > 64 || id.contains("..")) return false;
+        char c0 = id.charAt(0);
+        if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z'))) return false;
+        for (int i = 0; i < id.length(); i++) {
+            char c = id.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    private String mgmtCall(String payload, int timeoutMs) {
+        LocalSocket s = new LocalSocket();
+        try {
+            s.connect(new LocalSocketAddress(MGMT_SOCKET_FILE.getPath(),
+                    LocalSocketAddress.Namespace.FILESYSTEM));
+            s.setSoTimeout(timeoutMs);
+            byte[] reqBytes = payload.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer hdr = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+            hdr.putInt(reqBytes.length);
+            s.getOutputStream().write(hdr.array());
+            s.getOutputStream().write(reqBytes);
+            s.getOutputStream().flush();
+
+            InputStream in = s.getInputStream();
+            byte[] rhdr = new byte[8];
+            int got = 0;
+            while (got < rhdr.length) {
+                int n = in.read(rhdr, got, rhdr.length - got);
+                if (n < 0) return "1\nmgmt daemon closed connection";
+                got += n;
+            }
+            ByteBuffer bb = ByteBuffer.wrap(rhdr).order(ByteOrder.LITTLE_ENDIAN);
+            int code = bb.getInt(0);
+            int outLen = bb.getInt(4);
+            if (outLen < 0 || outLen > 512 * 1024) return "1\ninvalid response size";
+            byte[] out = new byte[outLen];
+            got = 0;
+            while (got < outLen) {
+                int n = in.read(out, got, outLen - got);
+                if (n < 0) break;
+                got += n;
+            }
+            return code + "\n" + new String(out, 0, got, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return "1\n" + e.getMessage();
+        } finally {
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static String stripCodePrefix(String raw, String fallback) {
+        int nl = raw.indexOf('\n');
+        if (nl <= 0) return fallback;
+        return "0".equals(raw.substring(0, nl)) ? raw.substring(nl + 1) : fallback;
+    }
+
+    @Override
+    public String listModulesJson() {
+        enforce();
+        if (MGMT_SOCKET_FILE.exists()) {
+            return stripCodePrefix(mgmtCall("LIST", 5000), "[]");
+        }
+        return "[]";
+    }
+
+    @Override
+    public String installModuleFromCache(String fileName) {
+        enforceMutate();
+        if (fileName == null || fileName.isEmpty() || fileName.length() > 128
+                || fileName.contains("/") || fileName.contains("..") || !fileName.endsWith(".zip")) {
+            return "1\ninvalid staging filename";
+        }
+        int userId = UserHandle.getCallingUserId();
+        String staged = "/data/user/" + userId + "/" + LARAS_PACKAGE + "/cache/akar_install/" + fileName;
+        String res = mgmtCall("INSTALL " + staged, 90_000);
+        svcAudit("MOD_INSTALL", fileName);
+        return res;
+    }
+
+    @Override
+    public boolean setModuleEnabled(String id, boolean enabled) {
+        enforceMutate();
+        if (!isValidModuleId(id)) return false;
+        String res = mgmtCall((enabled ? "ENABLE " : "DISABLE ") + id, 5000);
+        boolean ok = res.startsWith("0\n");
+        if (ok) svcAudit(enabled ? "MOD_ENABLE" : "MOD_DISABLE", id);
+        return ok;
+    }
+
+    @Override
+    public boolean setModuleRemove(String id, boolean remove) {
+        enforceMutate();
+        if (!isValidModuleId(id)) return false;
+        String res = mgmtCall((remove ? "REMOVE " : "UNDO_REMOVE ") + id, 5000);
+        boolean ok = res.startsWith("0\n");
+        if (ok) svcAudit(remove ? "MOD_REMOVE" : "MOD_UNDO_REMOVE", id);
+        return ok;
+    }
+
+    @Override
+    public String runModuleAction(String id) {
+        enforceMutate();
+        if (!isValidModuleId(id)) return "1\ninvalid module id";
+        svcAudit("MOD_ACTION", id);
+        return mgmtCall("ACTION " + id, 65_000);
+    }
+
+    @Override
+    public String getBootguardStatusJson() {
+        enforce();
+        if (MGMT_SOCKET_FILE.exists()) {
+            String fromDaemon = stripCodePrefix(mgmtCall("BG_STATUS", 3000), "");
+            if (!fromDaemon.isEmpty()) return fromDaemon;
+        }
+        // Fallback: read bootguard.status directly (works even in Safe Mode when rootd is stopped).
+        org.json.JSONObject jo = new org.json.JSONObject();
+        try {
+            jo.put("bootcount", 0);
+            jo.put("safeMode", false);
+            jo.put("reason", "none");
+            jo.put("keyTrigger", "");
+            jo.put("disabledSuspects", new org.json.JSONArray());
+            jo.put("zygiskBypassed", false);
+            if (BOOTGUARD_STATUS_FILE.isFile()) {
+                for (String line : readLines(BOOTGUARD_STATUS_FILE)) {
+                    int eq = line.indexOf('=');
+                    if (eq <= 0) continue;
+                    String k = line.substring(0, eq).trim();
+                    String v = line.substring(eq + 1).trim();
+                    switch (k) {
+                        case "bootcount": jo.put("bootcount", Integer.parseInt(v)); break;
+                        case "safe_mode": jo.put("safeMode", "1".equals(v) || "true".equals(v)); break;
+                        case "reason": jo.put("reason", v); break;
+                        case "key_trigger": jo.put("keyTrigger", v); break;
+                        case "zygisk_bypassed": jo.put("zygiskBypassed", "1".equals(v) || "true".equals(v)); break;
+                        case "disabled_suspects": {
+                            org.json.JSONArray arr = new org.json.JSONArray();
+                            for (String s : v.split(",")) {
+                                if (!s.trim().isEmpty()) arr.put(s.trim());
+                            }
+                            jo.put("disabledSuspects", arr);
+                            break;
+                        }
+                        default: break;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return jo.toString();
+    }
+
+    @Override
+    public boolean clearSafeMode() {
+        enforceMutate();
+        if (MGMT_SOCKET_FILE.exists()) {
+            String res = mgmtCall("BG_CLEAR", 5000);
+            if (res.startsWith("0\n")) {
+                svcAudit("BOOTGUARD", "clear_safemode");
+                return true;
+            }
+        }
+        File flag = new File(DIR, "safemode");
+        if (flag.exists()) flag.delete();
+        BOOTGUARD_STATUS_FILE.delete();
+        svcAudit("BOOTGUARD", "clear_safemode_direct");
+        return true;
+    }
+
+    @Override
+    public String getZygiskConfigJson() {
+        enforce();
+        org.json.JSONObject jo = new org.json.JSONObject();
+        try {
+            boolean modulesEnabled = false;
+            if (MODULES_CONF_FILE.isFile()) {
+                for (String line : readLines(MODULES_CONF_FILE)) {
+                    int eq = line.indexOf('=');
+                    if (eq <= 0 || line.startsWith("#")) continue;
+                    if ("enabled".equals(line.substring(0, eq).trim())) {
+                        String v = line.substring(eq + 1).trim();
+                        modulesEnabled = "1".equals(v) || "true".equals(v);
+                    }
+                }
+            }
+            boolean enabled = false;
+            org.json.JSONArray denylist = new org.json.JSONArray();
+            org.json.JSONObject scopes = new org.json.JSONObject();
+            if (ZYGISK_CONF_FILE.isFile()) {
+                for (String line : readLines(ZYGISK_CONF_FILE)) {
+                    int eq = line.indexOf('=');
+                    if (eq <= 0 || line.startsWith("#")) continue;
+                    String k = line.substring(0, eq).trim();
+                    String v = line.substring(eq + 1).trim();
+                    if ("enabled".equals(k)) {
+                        enabled = "1".equals(v) || "true".equals(v);
+                    } else if ("denylist".equals(k)) {
+                        for (String u : v.split(",")) {
+                            if (!u.trim().isEmpty()) denylist.put(Integer.parseInt(u.trim()));
+                        }
+                    } else if (k.startsWith("scope.")) {
+                        String id = k.substring("scope.".length());
+                        org.json.JSONArray arr = new org.json.JSONArray();
+                        if (!"*".equals(v) && !v.isEmpty()) {
+                            for (String u : v.split(",")) {
+                                if (!u.trim().isEmpty()) arr.put(Integer.parseInt(u.trim()));
+                            }
+                        }
+                        scopes.put(id, arr);
+                    }
+                }
+            }
+            boolean defaultUnmount = true;
+            org.json.JSONArray forceUnmount = new org.json.JSONArray();
+            org.json.JSONArray exemptUnmount = new org.json.JSONArray();
+            if (UNMOUNT_CONF_FILE.isFile()) {
+                for (String line : readLines(UNMOUNT_CONF_FILE)) {
+                    int eq = line.indexOf('=');
+                    if (eq <= 0 || line.startsWith("#")) continue;
+                    String k = line.substring(0, eq).trim();
+                    String v = line.substring(eq + 1).trim();
+                    if ("default_unmount".equals(k)) {
+                        defaultUnmount = "1".equals(v) || "true".equals(v);
+                    } else if ("force".equals(k)) {
+                        for (String u : v.split(",")) {
+                            if (!u.trim().isEmpty()) forceUnmount.put(Integer.parseInt(u.trim()));
+                        }
+                    } else if ("exempt".equals(k)) {
+                        for (String u : v.split(",")) {
+                            if (!u.trim().isEmpty()) exemptUnmount.put(Integer.parseInt(u.trim()));
+                        }
+                    }
+                }
+            }
+            jo.put("modulesEnabled", modulesEnabled);
+            jo.put("enabled", enabled);
+            jo.put("denylist", denylist);
+            jo.put("scopes", scopes);
+            jo.put("defaultUnmount", defaultUnmount);
+            jo.put("forceUnmount", forceUnmount);
+            jo.put("exemptUnmount", exemptUnmount);
+        } catch (Exception e) {
+            Slog.w(TAG, "getZygiskConfigJson", e);
+        }
+        return jo.toString();
+    }
+
+    @Override
+    public boolean setZygiskConfigJson(String configJson) {
+        enforceMutate();
+        if (configJson == null || configJson.length() > 64 * 1024) return false;
+        try {
+            org.json.JSONObject jo = new org.json.JSONObject(configJson);
+            boolean modOn = jo.optBoolean("modulesEnabled", false);
+            writeAtomicConf(MODULES_CONF_FILE,
+                    "# yasvara-modules v1\nenabled=" + (modOn ? 1 : 0) + "\n");
+
+            StringBuilder zsb = new StringBuilder("# yasvara-zygisk v1\n");
+            zsb.append("enabled=").append((modOn && jo.optBoolean("enabled", false)) ? 1 : 0).append('\n');
+            zsb.append("denylist=").append(joinIntArray(jo.optJSONArray("denylist"))).append('\n');
+            org.json.JSONObject scopes = jo.optJSONObject("scopes");
+            if (scopes != null) {
+                for (Iterator<String> it = scopes.keys(); it.hasNext(); ) {
+                    String id = it.next();
+                    if (!isValidModuleId(id)) continue;
+                    String joined = joinIntArray(scopes.optJSONArray(id));
+                    zsb.append("scope.").append(id).append('=').append(joined.isEmpty() ? "*" : joined).append('\n');
+                }
+            }
+            writeAtomicConf(ZYGISK_CONF_FILE, zsb.toString());
+
+            StringBuilder usb = new StringBuilder("# yasvara-unmount v1\n");
+            usb.append("default_unmount=").append(jo.optBoolean("defaultUnmount", true) ? 1 : 0).append('\n');
+            usb.append("force=").append(joinIntArray(jo.optJSONArray("forceUnmount"))).append('\n');
+            usb.append("exempt=").append(joinIntArray(jo.optJSONArray("exemptUnmount"))).append('\n');
+            writeAtomicConf(UNMOUNT_CONF_FILE, usb.toString());
+
+            svcAudit("ZYGISK_CFG", "enabled=" + jo.optBoolean("enabled", false));
+            return true;
+        } catch (Exception e) {
+            Slog.w(TAG, "setZygiskConfigJson", e);
+            return false;
+        }
+    }
+
+    private static String joinIntArray(org.json.JSONArray arr) {
+        if (arr == null || arr.length() == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < arr.length(); i++) {
+            int v = arr.optInt(i, -1);
+            if (v >= 0) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(v);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void writeAtomicConf(File target, String content) throws IOException, ErrnoException {
+        AtomicFile f = new AtomicFile(target);
+        FileOutputStream out = null;
+        try {
+            out = f.startWrite();
+            Os.fchmod(out.getFD(), 0660);
+            out.write(content.getBytes(StandardCharsets.UTF_8));
+            f.finishWrite(out);
+        } catch (IOException | ErrnoException e) {
+            if (out != null) f.failWrite(out);
+            throw e;
+        }
+    }
+
+    @Override
+    public String execModuleShell(String moduleId, String command) {
+        enforceMutate();
+        if (!isValidModuleId(moduleId) || command == null || command.length() > 16 * 1024) {
+            return "1\ninvalid request";
+        }
+        svcAudit("MOD_WEBUI_EXEC", moduleId);
+        return mgmtCall("EXEC " + moduleId + "\n" + command, 30_000);
     }
 
     // ---------------------------------------------------------------------------------------

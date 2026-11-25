@@ -139,6 +139,11 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
 
     /** APK path to whether it holds module code, so a rebuild reopens only changed APKs. */
     private final ArrayMap<String, Boolean> mModuleApks = new ArrayMap<>();
+    /** True once the initial rebuild has completed on BackgroundThread. */
+    private boolean mInitialBuilt = false;
+    /** Cached package->appId map from the latest rebuild for O(1) batch simulation. */
+    private ArrayMap<String, Integer> mLastPkgToAppId = new ArrayMap<>();
+    private List<String> mInstalledUserPackages = new ArrayList<>();
 
     private final Runnable mRebuildRunnable = this::rebuild;
     private final Runnable mWriteRunnable = this::writeNow;
@@ -152,7 +157,9 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
                 seedDefaultTemplatesLocked();
             }
         }
-        rebuild();
+        // Build asynchronously at front of BackgroundThread so SystemServer startup pays 0 ms
+        // for APK ZIP scans while still completing before user apps launch.
+        mHandler.postAtFrontOfQueue(mRebuildRunnable);
         registerReceivers();
     }
 
@@ -300,7 +307,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
     @Override
     public String[] getXposedModules() {
         enforce();
-        refreshRebuildUnderSystemIdentity();
+        ensureBuilt();
         synchronized (mLock) {
             return mModules.toArray(new String[0]);
         }
@@ -309,7 +316,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
     @Override
     public String[] getDetectedRomPackages() {
         enforce();
-        refreshRebuildUnderSystemIdentity();
+        ensureBuilt();
         synchronized (mLock) {
             return mDetectedRomPackages.toArray(new String[0]);
         }
@@ -318,7 +325,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
     @Override
     public String[] getDetectedRootPackages() {
         enforce();
-        refreshRebuildUnderSystemIdentity();
+        ensureBuilt();
         synchronized (mLock) {
             return mDetectedRootPackages.toArray(new String[0]);
         }
@@ -521,7 +528,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
     @Override
     public int forceStopHiddenTargets() {
         enforce();
-        refreshRebuildUnderSystemIdentity();
+        ensureBuilt();
         final ArrayList<String> targets;
         synchronized (mLock) {
             targets = new ArrayList<>(mForceStoppableHiddenPackages);
@@ -547,47 +554,245 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
     }
 
     @Override
+    public boolean forceStopPackage(String packageName) {
+        enforce();
+        if (packageName == null || packageName.isEmpty() || "android".equals(packageName)) {
+            return false;
+        }
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            ActivityManager am = mContext.getSystemService(ActivityManager.class);
+            if (am == null) return false;
+            am.forceStopPackage(packageName);
+            return true;
+        } catch (RuntimeException e) {
+            Slog.w(TAG, "Failed to force-stop " + packageName, e);
+            return false;
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+    }
+
+    @Override
+    public String getUiSnapshotJson() {
+        enforce();
+        ensureBuilt();
+        synchronized (mLock) {
+            try {
+                JSONObject root = buildConfigJsonLocked();
+                root.put("modules", toJsonArray(mModules));
+                root.put("detectedRom", toJsonArray(mDetectedRomPackages));
+                root.put("detectedRoot", toJsonArray(mDetectedRootPackages));
+                return root.toString();
+            } catch (JSONException e) {
+                Slog.e(TAG, "getUiSnapshotJson failed", e);
+                return "{}";
+            }
+        }
+    }
+
+    @Override
+    public String evaluateObserverJson(String observer) {
+        enforce();
+        if (observer == null || observer.isEmpty()) return "{}";
+        ensureBuilt();
+        final ArrayList<String> candidates = new ArrayList<>();
+        final int observerAppId;
+        final int effectiveMode;
+        synchronized (mLock) {
+            Integer obsObj = mLastPkgToAppId.get(observer);
+            if (obsObj == null) return "{}";
+            observerAppId = obsObj;
+            ObserverRule obsRule = mObserverRules.get(observer);
+            effectiveMode = obsRule != null ? obsRule.mode : MODE_GLOBAL;
+
+            ArraySet<String> seen = new ArraySet<>();
+            seen.addAll(mHidden);
+            seen.addAll(mModules);
+            seen.addAll(mDetectedRootPackages);
+            seen.addAll(mDetectedRomPackages);
+            if (obsRule != null) {
+                seen.addAll(obsRule.packages);
+                for (int t = 0; t < obsRule.templates.size(); t++) {
+                    TemplateRule tpl = mTemplates.get(obsRule.templates.valueAt(t));
+                    if (tpl != null) seen.addAll(tpl.packages);
+                }
+                if (obsRule.mode == MODE_WHITELIST) {
+                    seen.addAll(mInstalledUserPackages);
+                }
+            }
+            seen.remove(observer);
+            seen.remove("android");
+            candidates.addAll(seen);
+        }
+
+        final YasvaraTabirPolicy policy = YasvaraTabirPolicy.current();
+        try {
+            JSONObject out = new JSONObject();
+            out.put("observer", observer);
+            out.put("mode", effectiveMode);
+            out.put("devHidden", policy.concealsDevSettings(observerAppId));
+            JSONObject results = new JSONObject();
+            synchronized (mLock) {
+                for (int i = 0; i < candidates.size(); i++) {
+                    String target = candidates.get(i);
+                    Integer targetAppId = mLastPkgToAppId.get(target);
+                    if (targetAppId == null) continue;
+                    results.put(target, policy.hidesPackage(observerAppId, targetAppId, target));
+                }
+            }
+            out.put("results", results);
+            return out.toString();
+        } catch (JSONException e) {
+            Slog.e(TAG, "evaluateObserverJson failed", e);
+            return "{}";
+        }
+    }
+
+    @Override
+    public void setTemplateWithAppliedApps(String oldName, String newName, int mode,
+            String[] targetPackages, String[] appliedObservers) {
+        enforce();
+        if (newName == null || newName.trim().isEmpty()) {
+            throw new IllegalArgumentException("Template name must not be empty");
+        }
+        if (mode != MODE_BLACKLIST && mode != MODE_WHITELIST) {
+            throw new IllegalArgumentException("Invalid template mode: " + mode);
+        }
+        final String cleanNew = newName.trim();
+        final String cleanOld = oldName != null ? oldName.trim() : null;
+        final ArraySet<String> appliedSet = new ArraySet<>();
+        if (appliedObservers != null) {
+            for (String obs : appliedObservers) {
+                if (obs != null && !obs.isEmpty()) appliedSet.add(obs);
+            }
+        }
+        synchronized (mLock) {
+            if (cleanOld != null && !cleanOld.isEmpty() && !cleanOld.equals(cleanNew)) {
+                mTemplates.remove(cleanOld);
+                for (int i = 0; i < mObserverRules.size(); i++) {
+                    ObserverRule r = mObserverRules.valueAt(i);
+                    if (r.templates.remove(cleanOld)) {
+                        r.templates.add(cleanNew);
+                    }
+                }
+            }
+            TemplateRule tpl = new TemplateRule(mode);
+            if (targetPackages != null) {
+                for (String pkg : targetPackages) {
+                    if (pkg != null && !pkg.isEmpty()) tpl.packages.add(pkg);
+                }
+            }
+            mTemplates.put(cleanNew, tpl);
+
+            // Sync applied observers bidirectionally (HMA-OSS style):
+            // 1. Remove template from observers no longer selected (and clear empty override).
+            for (int i = mObserverRules.size() - 1; i >= 0; i--) {
+                String obs = mObserverRules.keyAt(i);
+                ObserverRule rule = mObserverRules.valueAt(i);
+                if (!appliedSet.contains(obs)) {
+                    if (rule.templates.remove(cleanNew)
+                            && rule.templates.isEmpty()
+                            && rule.packages.isEmpty()) {
+                        mObserverRules.removeAt(i);
+                    }
+                }
+            }
+            // 2. Attach template to every selected observer (switching mode if needed so it matches).
+            for (int i = 0; i < appliedSet.size(); i++) {
+                String obs = appliedSet.valueAt(i);
+                ObserverRule rule = mObserverRules.get(obs);
+                if (rule == null) {
+                    rule = new ObserverRule(mode);
+                    mObserverRules.put(obs, rule);
+                } else if (rule.mode != mode) {
+                    rule.mode = mode;
+                    rule.templates.clear();
+                }
+                rule.templates.add(cleanNew);
+            }
+        }
+        changed();
+    }
+
+    @Override
+    public void setBulkObserverConfig(String[] observers, int mode,
+            String[] packages, String[] templates) {
+        enforce();
+        if (observers == null || observers.length == 0) return;
+        if (mode != MODE_GLOBAL && mode != MODE_BLACKLIST && mode != MODE_WHITELIST) {
+            throw new IllegalArgumentException("Invalid observer mode: " + mode);
+        }
+        synchronized (mLock) {
+            for (String obs : observers) {
+                if (obs == null || obs.isEmpty()) continue;
+                if (mode == MODE_GLOBAL) {
+                    mObserverRules.remove(obs);
+                } else {
+                    ObserverRule rule = new ObserverRule(mode);
+                    if (packages != null) {
+                        for (String pkg : packages) {
+                            if (pkg != null && !pkg.isEmpty()) rule.packages.add(pkg);
+                        }
+                    }
+                    if (templates != null) {
+                        for (String tpl : templates) {
+                            if (tpl != null && !tpl.isEmpty()) rule.templates.add(tpl);
+                        }
+                    }
+                    mObserverRules.put(obs, rule);
+                }
+            }
+        }
+        changed();
+    }
+
+    @Override
     public String exportConfigJson() {
         enforce();
         synchronized (mLock) {
             try {
-                JSONObject root = new JSONObject();
-                root.put("version", 1);
-                root.put("scope", mScope);
-                root.put("hideXposed", mHideXposed);
-                root.put("hideRomPackages", mHideRomPackages);
-                root.put("hideRootTooling", mHideRootTooling);
-                root.put("devOptionsHideMode", mDevOptionsHideMode);
-                root.put("hidden", toJsonArray(mHidden));
-                root.put("observers", toJsonArray(mObservers));
-                root.put("exceptions", toJsonArray(mExceptions));
-
-                JSONObject templatesObj = new JSONObject();
-                for (int i = 0; i < mTemplates.size(); i++) {
-                    TemplateRule tpl = mTemplates.valueAt(i);
-                    JSONObject tplObj = new JSONObject();
-                    tplObj.put("mode", tpl.mode);
-                    tplObj.put("packages", toJsonArray(tpl.packages));
-                    templatesObj.put(mTemplates.keyAt(i), tplObj);
-                }
-                root.put("templates", templatesObj);
-
-                JSONObject rulesObj = new JSONObject();
-                for (int i = 0; i < mObserverRules.size(); i++) {
-                    ObserverRule rule = mObserverRules.valueAt(i);
-                    JSONObject ruleObj = new JSONObject();
-                    ruleObj.put("mode", rule.mode);
-                    ruleObj.put("packages", toJsonArray(rule.packages));
-                    ruleObj.put("templates", toJsonArray(rule.templates));
-                    rulesObj.put(mObserverRules.keyAt(i), ruleObj);
-                }
-                root.put("observerRules", rulesObj);
-                return root.toString(2);
+                return buildConfigJsonLocked().toString(2);
             } catch (JSONException e) {
                 Slog.e(TAG, "exportConfigJson failed", e);
                 return "{}";
             }
         }
+    }
+
+    private JSONObject buildConfigJsonLocked() throws JSONException {
+        JSONObject root = new JSONObject();
+        root.put("version", 1);
+        root.put("scope", mScope);
+        root.put("hideXposed", mHideXposed);
+        root.put("hideRomPackages", mHideRomPackages);
+        root.put("hideRootTooling", mHideRootTooling);
+        root.put("devOptionsHideMode", mDevOptionsHideMode);
+        root.put("hidden", toJsonArray(mHidden));
+        root.put("observers", toJsonArray(mObservers));
+        root.put("exceptions", toJsonArray(mExceptions));
+
+        JSONObject templatesObj = new JSONObject();
+        for (int i = 0; i < mTemplates.size(); i++) {
+            TemplateRule tpl = mTemplates.valueAt(i);
+            JSONObject tplObj = new JSONObject();
+            tplObj.put("mode", tpl.mode);
+            tplObj.put("packages", toJsonArray(tpl.packages));
+            templatesObj.put(mTemplates.keyAt(i), tplObj);
+        }
+        root.put("templates", templatesObj);
+
+        JSONObject rulesObj = new JSONObject();
+        for (int i = 0; i < mObserverRules.size(); i++) {
+            ObserverRule rule = mObserverRules.valueAt(i);
+            JSONObject ruleObj = new JSONObject();
+            ruleObj.put("mode", rule.mode);
+            ruleObj.put("packages", toJsonArray(rule.packages));
+            ruleObj.put("templates", toJsonArray(rule.templates));
+            rulesObj.put(mObserverRules.keyAt(i), ruleObj);
+        }
+        root.put("observerRules", rulesObj);
+        return root;
     }
 
     @Override
@@ -700,6 +905,16 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
         mContext.enforceCallingOrSelfPermission(PERMISSION, TAG);
     }
 
+    private void ensureBuilt() {
+        boolean built;
+        synchronized (mLock) {
+            built = mInitialBuilt;
+        }
+        if (!built) {
+            refreshRebuildUnderSystemIdentity();
+        }
+    }
+
     private void refreshRebuildUnderSystemIdentity() {
         final long ident = Binder.clearCallingIdentity();
         try {
@@ -784,11 +999,23 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
         ArrayMap<String, Integer> pkgToAppId = new ArrayMap<>(installed.size());
         ArrayMap<String, Boolean> pkgIsSystem = new ArrayMap<>(installed.size());
 
+        // Pre-pass (O(N), zero extra Binder calls): collect every UID hosting at least one system
+        // package so shared-with-system user packages are detected without pm.getPackagesForUid().
+        ArraySet<Integer> systemUids = new ArraySet<>();
+        for (int i = 0; i < installed.size(); i++) {
+            ApplicationInfo app = installed.get(i).applicationInfo;
+            if (app != null && app.isSystemApp()) {
+                systemUids.add(app.uid);
+            }
+        }
+
         ArraySet<Integer> exemptCallers = new ArraySet<>();
         ArraySet<Integer> protectedSystemAppIds = new ArraySet<>();
+        ArraySet<Integer> xposedModuleAppIds = new ArraySet<>();
         ArraySet<String> modulesSet = new ArraySet<>();
         ArrayList<String> detectedRom = new ArrayList<>();
         ArrayList<String> detectedRoot = new ArrayList<>();
+        ArrayList<String> userPackages = new ArrayList<>();
         ArraySet<String> apks = new ArraySet<>();
 
         // Pass 1: classify every installed package, exempt callers, and non-ROM system appIds.
@@ -799,7 +1026,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
             if (pkg == null || pkg.isEmpty()) continue;
             final int appId = UserHandle.getAppId(app.uid);
             final boolean sys = app.isSystemApp()
-                    || (info.sharedUserId != null && isSharedWithSystem(pm, info));
+                    || (info.sharedUserId != null && systemUids.contains(app.uid));
 
             pkgToAppId.put(pkg, appId);
             pkgIsSystem.put(pkg, sys);
@@ -817,6 +1044,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
                 continue;
             }
 
+            userPackages.add(pkg);
             if (pkg.equals(homePkg)) {
                 exemptCallers.add(appId);
                 if (appId >= YasvaraTabirPolicy.FIRST_APPLICATION_UID) {
@@ -827,15 +1055,18 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
             if (app.sourceDir != null) {
                 apks.add(app.sourceDir);
             }
-            if (isModule(app)) {
+            if (isModule(app, mHideXposed)) {
                 modulesSet.add(pkg);
+                xposedModuleAppIds.add(appId);
             }
             if (KNOWN_ROOT_TOOLING_PACKAGES.contains(pkg)) {
                 detectedRoot.add(pkg);
             }
         }
 
-        mModuleApks.retainAll(apks);
+        if (mHideXposed) {
+            mModuleApks.retainAll(apks);
+        }
         ArrayList<String> sortedModules = new ArrayList<>(modulesSet);
         Collections.sort(sortedModules);
         Collections.sort(detectedRom);
@@ -843,6 +1074,9 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
         mModules = sortedModules;
         mDetectedRomPackages = detectedRom;
         mDetectedRootPackages = detectedRoot;
+        mLastPkgToAppId = pkgToAppId;
+        mInstalledUserPackages = userPackages;
+        mInitialBuilt = true;
 
         // Pass 2: build global hidden sets, force-stoppable set, and global caller sets.
         ArraySet<Integer> globalHiddenAppIds = new ArraySet<>();
@@ -994,6 +1228,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
                 .setExemptCallers(toIntArray(exemptCallers))
                 .setProtectedSystemAppIds(toIntArray(protectedSystemAppIds))
                 .setKnownHideableRomPackages(knownHideableRom)
+                .setXposedModuleAppIds(mHideXposed ? toIntArray(xposedModuleAppIds) : null)
                 .setObserverOverrides(
                         overrideCallers, overrideModes, overrideAppIds, overrideRomPkgs)
                 .setDevHideMode(mDevOptionsHideMode);
@@ -1012,24 +1247,9 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
         BroadcastStickyCache.invalidateCache(UsbManager.ACTION_USB_STATE);
     }
 
-    private static boolean isSharedWithSystem(PackageManager pm, PackageInfo info) {
-        String[] sharing = pm.getPackagesForUid(info.applicationInfo.uid);
-        if (sharing == null) return false;
-        for (String other : sharing) {
-            try {
-                if (pm.getApplicationInfo(other, PackageManager.MATCH_ANY_USER).isSystemApp()) {
-                    return true;
-                }
-            } catch (PackageManager.NameNotFoundException e) {
-                // Removed while we looked.
-            }
-        }
-        return false;
-    }
-
-    private boolean isModule(ApplicationInfo app) {
+    private boolean isModule(ApplicationInfo app, boolean allowApkZipScan) {
         if (app.metaData != null && app.metaData.containsKey(META_XPOSED)) return true;
-        if (app.sourceDir == null) return false;
+        if (!allowApkZipScan || app.sourceDir == null) return false;
         // sourceDir changes on every update, so an entry never goes stale.
         Boolean known = mModuleApks.get(app.sourceDir);
         if (known == null) {
@@ -1044,6 +1264,14 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
         int[] out = new int[values.size()];
         for (int i = 0; i < out.length; i++) out[i] = values.valueAt(i);
         return out;
+    }
+
+    private static JSONArray toJsonArray(List<String> values) {
+        JSONArray arr = new JSONArray();
+        for (int i = 0; i < values.size(); i++) {
+            arr.put(values.get(i));
+        }
+        return arr;
     }
 
     private static JSONArray toJsonArray(ArraySet<String> values) {

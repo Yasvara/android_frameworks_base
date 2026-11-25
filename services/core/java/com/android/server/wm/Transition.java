@@ -1343,9 +1343,14 @@ class Transition implements BLASTSyncEngine.TransactionReadyListener {
             // Ensure surfaceControls are re-parented back into the hierarchy.
             t.reparent(targetLeash, origParent);
             t.setLayer(targetLeash, target.getLastLayer());
-            t.setCornerRadius(targetLeash, 0);
+            // Yasvara Layang: keep rounded corners and ghost alpha across unrelated transitions
+            // since Shell applies fullFinish after TransitionObserver#onTransitionFinished.
+            final Task layangTask = target.asTask();
+            if (layangTask == null || !LayangCore.isLayang(layangTask)) {
+                t.setCornerRadius(targetLeash, 0);
+                t.setAlpha(targetLeash, 1);
+            }
             t.setShadowRadius(targetLeash, 0);
-            t.setAlpha(targetLeash, 1);
             // For config-at-end, the end-transform will be reset after the config is actually
             // applied in the client (since the transform depends on config). The other properties
             // remain here because shell might want to persistently override them.

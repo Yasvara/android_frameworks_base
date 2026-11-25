@@ -1383,7 +1383,12 @@ final class TaskDisplayArea extends DisplayArea<WindowContainer> {
         boolean supportsFreeform = mAtmService.mSupportsFreeformWindowManagement;
         boolean supportsPip = mAtmService.mSupportsPictureInPicture;
         if (supportsMultiWindow) {
-            if (task != null) {
+            if (r != null && LayangCore.isLayangCandidate(r)) {
+                // Yasvara: Layang launches float non-resizable games even when recycling a task.
+                supportsFreeform = mAtmService.mSupportsFreeformWindowManagement;
+                supportsPip = r.canEnterPictureInPicture();
+                supportsMultiWindow = mAtmService.mSupportsMultiWindow;
+            } else if (task != null) {
                 supportsFreeform = task.supportsFreeformInDisplayArea(this);
                 supportsMultiWindow = task.supportsMultiWindowInDisplayArea(this)
                         // When the activity needs to be moved to PIP while the Task is not in PIP,

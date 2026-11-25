@@ -1948,34 +1948,359 @@ static void YasvaraKaitAttach(JNIEnv* env, jstring nice_name, jstring app_data_d
 // every other app /system/xbin is root:shell 0750, so any name below it is EACCES whether it
 // exists or not, and this code returns after one stat() and a binary search.
 static constexpr char kTabirSetPath[] = "/data/misc/yasvara_root/enrolled.set";
+static constexpr char kTabirMountsPath[] = "/data/misc/yasvara_root/mounts.set";
+static constexpr char kTabirUnmountPath[] = "/data/misc/yasvara_root/unmount.set";
+static constexpr char kTabirZygiskPath[] = "/data/misc/yasvara_root/zygisk.set";
 static constexpr char kTabirRunPath[] = "/data/misc/yasvara_root/run";
 static constexpr char kTabirClientPath[] = "/system/xbin/yasvara_su";
 static constexpr char kTabirDir[] = "/system/xbin";
 static constexpr char kTabirSu[] = "/system/xbin/su";
 static constexpr char kTabirRunDir[] = "/system/xbin/.s";
 
-// enrolled.set: sorted little-endian uint32 uids, written by yasvara_rootd. The copy is reloaded
-// only when the file's mtime/size changed, so a spawn costs one stat() once the set is warm.
-static bool TabirUidEnrolled(uid_t uid) {
-    static std::mutex mu;
-    static std::vector<uint32_t> set;
-    static timespec mtime = {};
-    static off_t size = -1;
+// CoW-warm caches refreshed in the single-threaded Zygote parent inside ForkCommon() before
+// fork() so every child inherits warm read-only pages with zero per-launch open/read/malloc.
+static std::vector<uint32_t> gTabirEnrolledSet;
+static timespec gTabirEnrolledMtime = {};
+static off_t gTabirEnrolledSize = -1;
 
+static std::vector<std::string> gTabirMountsPaths;
+static timespec gTabirMountsMtime = {};
+static off_t gTabirMountsSize = -1;
+
+static bool gTabirUnmountDefault = true;
+static std::vector<uint32_t> gTabirUnmountForce;
+static std::vector<uint32_t> gTabirUnmountExempt;
+static timespec gTabirUnmountMtime = {};
+static off_t gTabirUnmountSize = -1;
+
+struct YasvaraZygiskModuleCache {
+    bool has_abi = false;
+    uint8_t scope_mode = 0;
+    std::vector<uint32_t> scope_uids;
+};
+static std::vector<uint8_t> gTabirZygiskRaw;
+static bool gTabirZygiskEnabled = false;
+static bool gTabirZygiskSafeBypass = false;
+static bool gTabirZygiskHasSystemServer = false;
+static std::vector<uint32_t> gTabirZygiskDenylist;
+static std::vector<YasvaraZygiskModuleCache> gTabirZygiskModules;
+static timespec gTabirZygiskMtime = {};
+static off_t gTabirZygiskSize = -1;
+
+// system_server crash circuit breaker: 2 crashes (3 forks) within 90s auto-bypasses Zygisk
+// for system_server so a buggy module cannot trap the device in a system_server crash loop.
+static time_t gZygiskSsStarts[3] = {0, 0, 0};
+static int gZygiskSsStartCount = 0;
+static bool gZygiskSsCircuitBroken = false;
+
+static bool ReadFileBytes(const char* path, std::vector<uint8_t>& out, size_t max_bytes) {
+    android::base::unique_fd fd(open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (fd < 0) return false;
     struct stat st;
-    if (stat(kTabirSetPath, &st) != 0) return false;
-    std::lock_guard<std::mutex> lock(mu);
-    if (st.st_size != size || st.st_mtim.tv_sec != mtime.tv_sec ||
-        st.st_mtim.tv_nsec != mtime.tv_nsec) {
-        std::vector<uint32_t> fresh(st.st_size / sizeof(uint32_t));
-        android::base::unique_fd fd(open(kTabirSetPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-        const size_t bytes = fresh.size() * sizeof(uint32_t);
-        if (fd < 0 || read(fd, fresh.data(), bytes) != static_cast<ssize_t>(bytes)) return false;
-        set.swap(fresh);
-        mtime = st.st_mtim;
-        size = st.st_size;
+    if (fstat(fd, &st) != 0 || st.st_size < 0 || static_cast<size_t>(st.st_size) > max_bytes) {
+        return false;
     }
-    return std::binary_search(set.begin(), set.end(), static_cast<uint32_t>(uid));
+    out.resize(static_cast<size_t>(st.st_size));
+    if (!out.empty() && read(fd, out.data(), out.size()) != static_cast<ssize_t>(out.size())) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static bool ReadLeU32(const std::vector<uint8_t>& buf, size_t& at, uint32_t& out) {
+    if (at + 4 > buf.size()) return false;
+    memcpy(&out, buf.data() + at, 4);
+    at += 4;
+    return true;
+}
+
+static bool ReadLeStr(const std::vector<uint8_t>& buf, size_t& at, std::string& out, size_t max_len) {
+    uint32_t len = 0;
+    if (!ReadLeU32(buf, at, len) || len > max_len || at + len > buf.size()) return false;
+    out.assign(reinterpret_cast<const char*>(buf.data() + at), len);
+    at += len;
+    return true;
+}
+
+static void TabirRefreshEnrolledCache() {
+    struct stat st;
+    if (stat(kTabirSetPath, &st) != 0) {
+        if (gTabirEnrolledSize != -1) {
+            gTabirEnrolledSet.clear();
+            gTabirEnrolledMtime = {};
+            gTabirEnrolledSize = -1;
+        }
+        return;
+    }
+    if (st.st_size == gTabirEnrolledSize &&
+        st.st_mtim.tv_sec == gTabirEnrolledMtime.tv_sec &&
+        st.st_mtim.tv_nsec == gTabirEnrolledMtime.tv_nsec) {
+        return;
+    }
+    const size_t count = static_cast<size_t>(st.st_size) / sizeof(uint32_t);
+    std::vector<uint32_t> fresh(count);
+    android::base::unique_fd fd(open(kTabirSetPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    const size_t bytes = count * sizeof(uint32_t);
+    if (fd < 0 || (bytes > 0 && read(fd, fresh.data(), bytes) != static_cast<ssize_t>(bytes))) {
+        return;
+    }
+    gTabirEnrolledSet.swap(fresh);
+    gTabirEnrolledMtime = st.st_mtim;
+    gTabirEnrolledSize = st.st_size;
+}
+
+static void TabirRefreshMountsCache() {
+    struct stat st;
+    if (stat(kTabirMountsPath, &st) != 0) {
+        if (gTabirMountsSize != -1) {
+            gTabirMountsPaths.clear();
+            gTabirMountsMtime = {};
+            gTabirMountsSize = -1;
+        }
+        return;
+    }
+    if (st.st_size == gTabirMountsSize &&
+        st.st_mtim.tv_sec == gTabirMountsMtime.tv_sec &&
+        st.st_mtim.tv_nsec == gTabirMountsMtime.tv_nsec) {
+        return;
+    }
+    std::vector<uint8_t> raw;
+    if (!ReadFileBytes(kTabirMountsPath, raw, 256 * 1024) || raw.size() < 12 ||
+        memcmp(raw.data(), "AKMT", 4) != 0) {
+        return;
+    }
+    size_t at = 4;
+    uint32_t ver = 0, count = 0;
+    if (!ReadLeU32(raw, at, ver) || ver != 1 || !ReadLeU32(raw, at, count) || count > 4096) {
+        return;
+    }
+    std::vector<std::string> paths;
+    paths.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string s;
+        if (!ReadLeStr(raw, at, s, 4096)) return;
+        paths.push_back(std::move(s));
+    }
+    gTabirMountsPaths.swap(paths);
+    gTabirMountsMtime = st.st_mtim;
+    gTabirMountsSize = st.st_size;
+}
+
+static void TabirRefreshUnmountCache() {
+    struct stat st;
+    if (stat(kTabirUnmountPath, &st) != 0) {
+        if (gTabirUnmountSize != -1) {
+            gTabirUnmountDefault = true;
+            gTabirUnmountForce.clear();
+            gTabirUnmountExempt.clear();
+            gTabirUnmountMtime = {};
+            gTabirUnmountSize = -1;
+        }
+        return;
+    }
+    if (st.st_size == gTabirUnmountSize &&
+        st.st_mtim.tv_sec == gTabirUnmountMtime.tv_sec &&
+        st.st_mtim.tv_nsec == gTabirUnmountMtime.tv_nsec) {
+        return;
+    }
+    std::vector<uint8_t> raw;
+    if (!ReadFileBytes(kTabirUnmountPath, raw, 256 * 1024) || raw.size() < 20 ||
+        memcmp(raw.data(), "AKUM", 4) != 0) {
+        return;
+    }
+    size_t at = 4;
+    uint32_t ver = 0, flags = 0, fc = 0, ec = 0;
+    if (!ReadLeU32(raw, at, ver) || ver != 1 || !ReadLeU32(raw, at, flags) ||
+        !ReadLeU32(raw, at, fc) || fc > 65536) {
+        return;
+    }
+    std::vector<uint32_t> force(fc);
+    for (uint32_t i = 0; i < fc; ++i) {
+        if (!ReadLeU32(raw, at, force[i])) return;
+    }
+    if (!ReadLeU32(raw, at, ec) || ec > 65536) return;
+    std::vector<uint32_t> exempt(ec);
+    for (uint32_t i = 0; i < ec; ++i) {
+        if (!ReadLeU32(raw, at, exempt[i])) return;
+    }
+    gTabirUnmountDefault = (flags & 1u) != 0;
+    gTabirUnmountForce.swap(force);
+    gTabirUnmountExempt.swap(exempt);
+    gTabirUnmountMtime = st.st_mtim;
+    gTabirUnmountSize = st.st_size;
+}
+
+static void TabirRefreshZygiskCache() {
+    struct stat st;
+    if (stat(kTabirZygiskPath, &st) != 0) {
+        if (gTabirZygiskSize != -1) {
+            gTabirZygiskRaw.clear();
+            gTabirZygiskEnabled = false;
+            gTabirZygiskSafeBypass = false;
+            gTabirZygiskHasSystemServer = false;
+            gTabirZygiskDenylist.clear();
+            gTabirZygiskModules.clear();
+            gTabirZygiskMtime = {};
+            gTabirZygiskSize = -1;
+        }
+        return;
+    }
+    if (st.st_size == gTabirZygiskSize &&
+        st.st_mtim.tv_sec == gTabirZygiskMtime.tv_sec &&
+        st.st_mtim.tv_nsec == gTabirZygiskMtime.tv_nsec) {
+        return;
+    }
+    std::vector<uint8_t> raw;
+    if (!ReadFileBytes(kTabirZygiskPath, raw, 512 * 1024) || raw.size() < 20 ||
+        memcmp(raw.data(), "AKZG", 4) != 0) {
+        return;
+    }
+    size_t at = 4;
+    uint32_t ver = 0, flags = 0, dc = 0, mc = 0;
+    if (!ReadLeU32(raw, at, ver) || ver != 1 || !ReadLeU32(raw, at, flags) ||
+        !ReadLeU32(raw, at, dc) || dc > 65536) {
+        return;
+    }
+    std::vector<uint32_t> deny(dc);
+    for (uint32_t i = 0; i < dc; ++i) {
+        if (!ReadLeU32(raw, at, deny[i])) return;
+    }
+    if (!ReadLeU32(raw, at, mc) || mc > 256) return;
+    std::vector<YasvaraZygiskModuleCache> mods;
+    mods.reserve(mc);
+    constexpr bool kIs64 = (sizeof(void*) == 8);
+    for (uint32_t i = 0; i < mc; ++i) {
+        std::string id, mod_dir, lib64, lib32;
+        if (!ReadLeStr(raw, at, id, 128) || !ReadLeStr(raw, at, mod_dir, 1024) ||
+            !ReadLeStr(raw, at, lib64, 1024) || !ReadLeStr(raw, at, lib32, 1024)) {
+            return;
+        }
+        if (at >= raw.size()) return;
+        uint8_t scope_mode = raw[at++];
+        uint32_t sc = 0;
+        if (!ReadLeU32(raw, at, sc) || sc > 65536) return;
+        std::vector<uint32_t> suids(sc);
+        for (uint32_t j = 0; j < sc; ++j) {
+            if (!ReadLeU32(raw, at, suids[j])) return;
+        }
+        YasvaraZygiskModuleCache entry;
+        entry.has_abi = kIs64 ? !lib64.empty() : !lib32.empty();
+        entry.scope_mode = scope_mode;
+        entry.scope_uids = std::move(suids);
+        mods.push_back(std::move(entry));
+    }
+    gTabirZygiskRaw.swap(raw);
+    gTabirZygiskEnabled = (flags & 1u) != 0;
+    gTabirZygiskSafeBypass = (flags & 2u) != 0;
+    gTabirZygiskHasSystemServer = (flags & 4u) != 0;
+    gTabirZygiskDenylist.swap(deny);
+    gTabirZygiskModules.swap(mods);
+    gTabirZygiskMtime = st.st_mtim;
+    gTabirZygiskSize = st.st_size;
+}
+
+static void TabirRefreshAllCaches() {
+    TabirRefreshEnrolledCache();
+    TabirRefreshMountsCache();
+    TabirRefreshUnmountCache();
+    TabirRefreshZygiskCache();
+}
+
+static bool UidInSorted(const std::vector<uint32_t>& vec, uid_t uid) {
+    if (vec.empty()) return false;
+    const uint32_t u = static_cast<uint32_t>(uid);
+    const uint32_t appid = static_cast<uint32_t>(uid % AID_USER_OFFSET);
+    return std::binary_search(vec.begin(), vec.end(), u) ||
+           std::binary_search(vec.begin(), vec.end(), appid);
+}
+
+static bool TabirUidEnrolled(uid_t uid) {
+    TabirRefreshEnrolledCache();
+    if (gTabirEnrolledSet.empty()) return false;
+    return std::binary_search(gTabirEnrolledSet.begin(), gTabirEnrolledSet.end(),
+                              static_cast<uint32_t>(uid));
+}
+
+// Detaches active module overlay/bind mounts inside the child's private mount namespace
+// while CAP_SYS_ADMIN is still held, leaving zero module mount entries visible to the app.
+static void TabirUnmount(uid_t uid, bool is_system_server, bool is_child_zygote,
+                         bool force_unmount, bool is_enrolled) {
+    if (is_system_server || is_child_zygote) return;
+    const uid_t appid = uid % AID_USER_OFFSET;
+    if (appid < AID_APP_START) return;
+    TabirRefreshMountsCache();
+    if (gTabirMountsPaths.empty()) return;
+    TabirRefreshUnmountCache();
+
+    bool should = force_unmount || UidInSorted(gTabirUnmountForce, uid);
+    if (!should && !UidInSorted(gTabirUnmountExempt, uid)) {
+        should = gTabirUnmountDefault && !is_enrolled;
+    }
+    if (!should) return;
+
+    for (auto it = gTabirMountsPaths.rbegin(); it != gTabirMountsPaths.rend(); ++it) {
+        umount2(it->c_str(), MNT_DETACH);
+    }
+}
+
+struct YasvaraZygiskAppArgs {
+    int32_t* uid;
+    int32_t* gid;
+    jintArray* gids;
+    int32_t* runtime_flags;
+    jobjectArray* rlimits;
+    int32_t* mount_external;
+    jstring* se_info;
+    jstring* nice_name;
+    jstring* instruction_set;
+    jstring* app_data_dir;
+    jintArray* fds_to_ignore;
+    uint8_t* is_child_zygote;
+    uint8_t* is_top_app;
+    jobjectArray* pkg_data_info_list;
+    jobjectArray* whitelisted_data_info_list;
+    uint8_t* mount_data_dirs;
+    uint8_t* mount_storage_dirs;
+    uint8_t* mount_sysprop_overrides;
+};
+
+struct YasvaraZygiskServerArgs {
+    int32_t* uid;
+    int32_t* gid;
+    jintArray* gids;
+    int32_t* runtime_flags;
+    int64_t* permitted_capabilities;
+    int64_t* effective_capabilities;
+};
+
+static bool YasvaraZygiskShouldLoad(uid_t uid, bool is_system_server, bool is_child_zygote,
+                                    bool& out_on_denylist) {
+    out_on_denylist = false;
+    if (is_child_zygote) return false;
+    TabirRefreshZygiskCache();
+    if (!gTabirZygiskEnabled || gTabirZygiskSafeBypass || gTabirZygiskModules.empty()) {
+        return false;
+    }
+    if (is_system_server) {
+        if (gZygiskSsCircuitBroken || !gTabirZygiskHasSystemServer) return false;
+        return true;
+    }
+    const uid_t appid = uid % AID_USER_OFFSET;
+    if (appid < AID_APP_START || (appid >= AID_ISOLATED_START && appid <= AID_ISOLATED_END)) {
+        return false;
+    }
+    if (UidInSorted(gTabirZygiskDenylist, uid)) {
+        out_on_denylist = true;
+        return false;  // DenyList apps NEVER dlopen libyasvara_zygisk.so (0 overhead, 0 trace!)
+    }
+    for (const auto& m : gTabirZygiskModules) {
+        if (!m.has_abi) continue;
+        if (m.scope_mode == 0 || UidInSorted(m.scope_uids, uid)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Bind-mounts the object behind `src_fd` (an O_PATH handle) onto a fresh placeholder at `dst`.
@@ -2075,8 +2400,67 @@ static void SpecializeCommon(JNIEnv* env, uid_t uid, gid_t gid, jintArray gids, 
     // Make sure app is running in its own mount namespace before isolating its data directories.
     ensureInAppMountNamespace(fail_fn);
 
-    // Yasvara Tabir: still privileged, in the app's own namespace, before SetGids/SetCapabilities.
-    TabirProject(uid, is_system_server, is_child_zygote);
+    // Yasvara Tabir + ROM-Native Zygisk: only the root Zygote (uid 0) ever projects su,
+    // loads Zygisk modules, or unmounts module overlays. webview_zygote (uid 1053) and
+    // app_zygote (uid >= 10000) skip this completely (zero stat syscalls, zero SELinux AVCs).
+    void* yasvara_zygisk_handle = nullptr;
+    int32_t zygisk_uid = static_cast<int32_t>(uid);
+    int32_t zygisk_gid = static_cast<int32_t>(gid);
+    jint zygisk_runtime_flags = runtime_flags;
+    jint zygisk_mount_external = mount_external;
+    jintArray zygisk_fds_to_ignore = nullptr;
+    uint8_t zygisk_is_child = is_child_zygote ? 1 : 0;
+    uint8_t zygisk_is_top = is_top_app ? 1 : 0;
+    uint8_t zygisk_mount_data = mount_data_dirs ? 1 : 0;
+    uint8_t zygisk_mount_storage = mount_storage_dirs ? 1 : 0;
+    uint8_t zygisk_mount_sysprop = mount_sysprop_overrides ? 1 : 0;
+    int64_t zygisk_perm_caps = static_cast<int64_t>(permitted_capabilities);
+    int64_t zygisk_eff_caps = static_cast<int64_t>(effective_capabilities);
+
+    YasvaraZygiskAppArgs zygisk_app_args = {
+            &zygisk_uid, &zygisk_gid, &gids, &zygisk_runtime_flags, &rlimits,
+            &zygisk_mount_external, &managed_se_info, &managed_nice_name,
+            &managed_instruction_set, &managed_app_data_dir, &zygisk_fds_to_ignore,
+            &zygisk_is_child, &zygisk_is_top, &pkg_data_info_list,
+            &allowlisted_data_info_list, &zygisk_mount_data, &zygisk_mount_storage,
+            &zygisk_mount_sysprop,
+    };
+    YasvaraZygiskServerArgs zygisk_server_args = {
+            &zygisk_uid, &zygisk_gid, &gids, &zygisk_runtime_flags,
+            &zygisk_perm_caps, &zygisk_eff_caps,
+    };
+
+    if (getuid() == 0) {
+        const bool yasvara_enrolled = TabirUidEnrolled(uid);
+        TabirProject(uid, is_system_server, is_child_zygote);
+
+        // Yasvara ROM-Native Zygisk (Phase 1): loaded lazily ONLY inside scoped children (never
+        // inside Zygote parent, never inside DenyList or out-of-scope apps).
+        bool yasvara_on_denylist = false;
+        bool yasvara_force_unmount = false;
+
+        if (YasvaraZygiskShouldLoad(uid, is_system_server, is_child_zygote, yasvara_on_denylist)) {
+            yasvara_zygisk_handle = dlopen("libyasvara_zygisk.so", RTLD_NOW | RTLD_LOCAL);
+            if (yasvara_zygisk_handle != nullptr) {
+                using PreFn = uint32_t (*)(JNIEnv*, uint32_t, bool, bool, bool, void*,
+                                           const uint8_t*, size_t);
+                auto pre = reinterpret_cast<PreFn>(dlsym(yasvara_zygisk_handle, "yasvara_zygisk_pre"));
+                if (pre != nullptr) {
+                    void* args_ptr = is_system_server ? static_cast<void*>(&zygisk_server_args)
+                                                      : static_cast<void*>(&zygisk_app_args);
+                    uint32_t out_flags = pre(env, static_cast<uint32_t>(uid), is_system_server,
+                                             yasvara_enrolled, yasvara_on_denylist, args_ptr,
+                                             gTabirZygiskRaw.data(), gTabirZygiskRaw.size());
+                    yasvara_force_unmount = (out_flags & 1u) != 0;
+                    runtime_flags = zygisk_runtime_flags;
+                }
+            }
+        }
+
+        // Detach active module mounts inside non-root / DenyList / force-unmounted app namespaces.
+        TabirUnmount(uid, is_system_server, is_child_zygote,
+                     yasvara_force_unmount || yasvara_on_denylist, yasvara_enrolled);
+    }
 
     // Isolate app data, jit profile and sandbox data directories by overlaying a tmpfs on those
     // dirs and bind mount all related packages separately.
@@ -2346,6 +2730,18 @@ static void SpecializeCommon(JNIEnv* env, uid_t uid, gid_t gid, jintArray gids, 
 
     if (env->ExceptionCheck()) {
         fail_fn("Error calling post fork hooks.");
+    }
+
+    // Yasvara ROM-Native Zygisk (Phase 2): postAppSpecialize / postServerSpecialize + dlclose.
+    if (yasvara_zygisk_handle != nullptr) {
+        using PostFn = void (*)(JNIEnv*, bool, const void*);
+        auto post = reinterpret_cast<PostFn>(dlsym(yasvara_zygisk_handle, "yasvara_zygisk_post"));
+        if (post != nullptr) {
+            const void* args_ptr = is_system_server ? static_cast<const void*>(&zygisk_server_args)
+                                                    : static_cast<const void*>(&zygisk_app_args);
+            post(env, is_system_server, args_ptr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
     // Yasvara Kait: after specialization and ART's post-fork hooks, before app code.
@@ -2634,6 +3030,32 @@ pid_t zygote::ForkCommon(JNIEnv* env, bool is_system_server,
   // file descriptors.
   __android_log_close();
   AStatsSocket_close();
+
+  // Yasvara Tabir + Native Zygisk: refresh enrolled/mounts/unmount/zygisk sets in the
+  // single-threaded root Zygote parent (uid 0 only — never webview_zygote or app_zygote)
+  // before FD-table validation and M_PURGE so forked children inherit warm CoW snapshots.
+  if (getuid() == 0) {
+    TabirRefreshAllCaches();
+  }
+  if (is_system_server && gTabirZygiskEnabled && gTabirZygiskHasSystemServer &&
+      !gZygiskSsCircuitBroken) {
+    struct timespec ts = {};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    const time_t now = ts.tv_sec;
+    int recent = 0;
+    for (int i = 0; i < gZygiskSsStartCount; ++i) {
+      if (now >= gZygiskSsStarts[i] && (now - gZygiskSsStarts[i]) <= 90) {
+        gZygiskSsStarts[recent++] = gZygiskSsStarts[i];
+      }
+    }
+    if (recent >= 2) {
+      ALOGW("YasvaraZygisk: system_server crashed twice within 90s; bypassing Zygisk");
+      gZygiskSsCircuitBroken = true;
+    } else {
+      gZygiskSsStarts[recent++] = now;
+    }
+    gZygiskSsStartCount = recent;
+  }
 
   // If this is the first fork for this zygote, create the open FD table,
   // verifying that files are of supported type and allowlisted.  Otherwise (not

@@ -36,4 +36,15 @@
     <string name="layang_menu_ratio">Bentuk jendela %1$s</string>
     <string name="layang_reflow_on">Tata letak app ini kini menyesuaikan jendela</string>
     <string name="layang_reflow_off">App ini kini diskalakan seperti layar ponsel</string>
+
+    <string name="layang_menu_tune">Setelan cepat</string>
+    <string name="layang_menu_settings">Setelan Layang</string>
+    <string name="layang_menu_relaunch">Buka ulang app untuk terapkan resolusi</string>
+    <string name="layang_tune_fps">Batas FPS</string>
+    <string name="layang_tune_fps_auto">Auto</string>
+    <string name="layang_tune_res">Resolusi</string>
+    <string name="layang_tune_res_native">Asli</string>
+    <string name="layang_tune_mini_size">Ukuran bubble</string>
+    <string name="layang_tune_ghost">Opasitas hantu</string>
+    <string name="layang_tune_relaunch_hint">Restart</string>
 </resources>

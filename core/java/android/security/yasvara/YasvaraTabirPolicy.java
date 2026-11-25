@@ -12,7 +12,7 @@ import java.util.Arrays;
  * <p>Lives in {@code framework.jar} so both {@code services.jar} ({@code AppsFilterBase},
  * {@code PermissionService}, {@code ComputerEngine}, {@code BroadcastController}) and in-process
  * {@code SettingsProvider} read the exact same {@code volatile} reference with zero IPC, zero
- * reflection, and sub-nanosecond empty fast-path cost.
+ * reflection, and O(1) cache-line bitset lookups on the hot path.
  *
  * @hide
  */
@@ -31,73 +31,193 @@ public final class YasvaraTabirPolicy {
     public static final int DEV_HIDE_OBSERVERS = 1;
     public static final int DEV_HIDE_ALL_NON_SYSTEM = 2;
 
+    private static final int BITSET_MAX_SPAN = 16384;
     private static final int[] NO_INTS = new int[0];
     private static final int[][] NO_INT_MATRIX = new int[0][];
     private static final String[] NO_STRINGS = new String[0];
     private static final String[][] NO_STRING_MATRIX = new String[0][];
+    private static final IntSet[] NO_INT_SETS = new IntSet[0];
+    private static final StringSet[] NO_STRING_SETS = new StringSet[0];
 
     public static final YasvaraTabirPolicy EMPTY = new Builder().build();
 
     private static volatile YasvaraTabirPolicy sCurrent = EMPTY;
 
+    /** Range-trimmed O(1) bitset for Android appIds, falling back to binary search for wide ranges. */
+    private static final class IntSet {
+        static final IntSet EMPTY = new IntSet(NO_INTS);
+
+        final int min;
+        final int max;
+        final long[] bits;
+        final int[] sorted;
+
+        IntSet(int[] raw) {
+            int[] arr = sortedUnique(raw);
+            sorted = arr;
+            if (arr.length == 0) {
+                min = Integer.MAX_VALUE;
+                max = Integer.MIN_VALUE;
+                bits = null;
+                return;
+            }
+            min = arr[0];
+            max = arr[arr.length - 1];
+            long span = (long) max - (long) min;
+            if (span >= 0 && span <= BITSET_MAX_SPAN) {
+                long[] b = new long[(int) (span >>> 6) + 1];
+                for (int v : arr) {
+                    int off = v - min;
+                    b[off >>> 6] |= 1L << (off & 63);
+                }
+                bits = b;
+            } else {
+                bits = null;
+            }
+        }
+
+        boolean isEmpty() {
+            return sorted.length == 0;
+        }
+
+        int size() {
+            return sorted.length;
+        }
+
+        boolean contains(int key) {
+            if (key < min || key > max) return false;
+            if (bits != null) {
+                int off = key - min;
+                return (bits[off >>> 6] & (1L << (off & 63))) != 0L;
+            }
+            return Arrays.binarySearch(sorted, key) >= 0;
+        }
+    }
+
+    /** Length-bounded + first-char bitmask pre-filtered sorted String set (0 comparisons on miss). */
+    private static final class StringSet {
+        static final StringSet EMPTY = new StringSet(NO_STRINGS);
+
+        final String[] sorted;
+        final int minLen;
+        final int maxLen;
+        final long firstCharMask;
+
+        StringSet(String[] raw) {
+            String[] arr = sortedUnique(raw);
+            sorted = arr;
+            if (arr.length == 0) {
+                minLen = Integer.MAX_VALUE;
+                maxLen = -1;
+                firstCharMask = 0L;
+                return;
+            }
+            int lo = Integer.MAX_VALUE;
+            int hi = 0;
+            long mask = 0L;
+            for (String s : arr) {
+                int len = s.length();
+                if (len < lo) lo = len;
+                if (len > hi) hi = len;
+                mask |= 1L << (s.charAt(0) & 63);
+            }
+            minLen = lo;
+            maxLen = hi;
+            firstCharMask = mask;
+        }
+
+        boolean isEmpty() {
+            return sorted.length == 0;
+        }
+
+        int size() {
+            return sorted.length;
+        }
+
+        boolean contains(String key) {
+            if (sorted.length == 0 || key == null) return false;
+            int len = key.length();
+            if (len < minLen || len > maxLen) return false;
+            if ((firstCharMask & (1L << (key.charAt(0) & 63))) == 0L) return false;
+            return Arrays.binarySearch(sorted, key) >= 0;
+        }
+    }
+
     private final boolean mIsEmpty;
-    private final int[] mGlobalHiddenAppIds;
-    private final String[] mGlobalHiddenRomPackages;
+    private final IntSet mGlobalHiddenAppIds;
+    private final StringSet mGlobalHiddenRomPackages;
     private final boolean mGlobalDenyByDefault;
     /** Global observers when !mGlobalDenyByDefault; allowed callers when mGlobalDenyByDefault. */
-    private final int[] mGlobalCallers;
+    private final IntSet mGlobalCallers;
 
     /** System apps + default Home launcher: never filtered as callers under any mode. */
-    private final int[] mExemptCallers;
+    private final IntSet mExemptCallers;
     /** Non-ROM system appIds (>= 10000): never hidden as targets even in Whitelist mode. */
-    private final int[] mProtectedSystemAppIds;
+    private final IntSet mProtectedSystemAppIds;
     /** Installed hideable ROM signature packages, hidden in Whitelist mode unless allowed. */
-    private final String[] mKnownHideableRomPackages;
+    private final StringSet mKnownHideableRomPackages;
+    /** Installed Xposed module appIds when hideXposed is active (gates metadata stripping). */
+    private final IntSet mXposedModuleAppIds;
 
-    /** Per-observer overrides sorted by observerAppId. */
+    /** Per-observer overrides sorted by observerAppId (exempt callers pre-stripped at build time). */
+    private final IntSet mOverrideCallerSet;
     private final int[] mOverrideCallers;
     private final int[] mOverrideModes;
-    private final int[][] mOverrideAppIds;
-    private final String[][] mOverrideRomPackages;
+    private final IntSet[] mOverrideAppIds;
+    private final StringSet[] mOverrideRomPackages;
 
     private final int mDevHideMode;
 
     private YasvaraTabirPolicy(Builder b) {
-        mGlobalHiddenAppIds = sortedUnique(b.mGlobalHiddenAppIds);
-        mGlobalHiddenRomPackages = sortedUnique(b.mGlobalHiddenRomPackages);
+        mGlobalHiddenAppIds = new IntSet(b.mGlobalHiddenAppIds);
+        mGlobalHiddenRomPackages = new StringSet(b.mGlobalHiddenRomPackages);
         mGlobalDenyByDefault = b.mGlobalDenyByDefault;
-        mGlobalCallers = sortedUnique(b.mGlobalCallers);
-        mExemptCallers = sortedUnique(b.mExemptCallers);
-        mProtectedSystemAppIds = sortedUnique(b.mProtectedSystemAppIds);
-        mKnownHideableRomPackages = sortedUnique(b.mKnownHideableRomPackages);
+        mGlobalCallers = new IntSet(b.mGlobalCallers);
+        mExemptCallers = new IntSet(b.mExemptCallers);
+        mProtectedSystemAppIds = new IntSet(b.mProtectedSystemAppIds);
+        mKnownHideableRomPackages = new StringSet(b.mKnownHideableRomPackages);
+        mXposedModuleAppIds = new IntSet(b.mXposedModuleAppIds);
 
-        int count = b.mOverrideCallers.length;
-        if (count == 0) {
+        int rawCount = b.mOverrideCallers.length;
+        int validCount = 0;
+        for (int i = 0; i < rawCount; i++) {
+            if (!mExemptCallers.contains(b.mOverrideCallers[i])) {
+                validCount++;
+            }
+        }
+        if (validCount == 0) {
+            mOverrideCallerSet = IntSet.EMPTY;
             mOverrideCallers = NO_INTS;
             mOverrideModes = NO_INTS;
-            mOverrideAppIds = NO_INT_MATRIX;
-            mOverrideRomPackages = NO_STRING_MATRIX;
+            mOverrideAppIds = NO_INT_SETS;
+            mOverrideRomPackages = NO_STRING_SETS;
         } else {
-            Integer[] order = new Integer[count];
-            for (int i = 0; i < count; i++) order[i] = i;
+            Integer[] order = new Integer[validCount];
+            int pos = 0;
+            for (int i = 0; i < rawCount; i++) {
+                if (!mExemptCallers.contains(b.mOverrideCallers[i])) {
+                    order[pos++] = i;
+                }
+            }
             Arrays.sort(order, (x, y) -> Integer.compare(b.mOverrideCallers[x], b.mOverrideCallers[y]));
 
-            mOverrideCallers = new int[count];
-            mOverrideModes = new int[count];
-            mOverrideAppIds = new int[count][];
-            mOverrideRomPackages = new String[count][];
-            for (int i = 0; i < count; i++) {
+            mOverrideCallers = new int[validCount];
+            mOverrideModes = new int[validCount];
+            mOverrideAppIds = new IntSet[validCount];
+            mOverrideRomPackages = new StringSet[validCount];
+            for (int i = 0; i < validCount; i++) {
                 int src = order[i];
                 mOverrideCallers[i] = b.mOverrideCallers[src];
                 mOverrideModes[i] = b.mOverrideModes[src];
-                mOverrideAppIds[i] = sortedUnique(b.mOverrideAppIds[src]);
-                mOverrideRomPackages[i] = sortedUnique(b.mOverrideRomPackages[src]);
+                mOverrideAppIds[i] = new IntSet(b.mOverrideAppIds[src]);
+                mOverrideRomPackages[i] = new StringSet(b.mOverrideRomPackages[src]);
             }
+            mOverrideCallerSet = new IntSet(mOverrideCallers);
         }
 
         mDevHideMode = b.mDevHideMode;
-        mIsEmpty = mGlobalHiddenAppIds.length == 0
-                && mGlobalHiddenRomPackages.length == 0
+        mIsEmpty = mGlobalHiddenAppIds.isEmpty()
+                && mGlobalHiddenRomPackages.isEmpty()
                 && mOverrideCallers.length == 0;
     }
 
@@ -110,15 +230,28 @@ public final class YasvaraTabirPolicy {
     }
 
     public static boolean shouldHidePackage(int callingAppId, int targetAppId, String targetPkg) {
-        return sCurrent.hidesPackage(callingAppId, targetAppId, targetPkg);
+        final YasvaraTabirPolicy p = sCurrent;
+        return !p.mIsEmpty && p.hidesPackage(callingAppId, targetAppId, targetPkg);
     }
 
     public static boolean shouldHideUid(int callingAppId, int targetAppId) {
-        return sCurrent.hidesUid(callingAppId, targetAppId);
+        final YasvaraTabirPolicy p = sCurrent;
+        return !p.mIsEmpty && p.hidesUid(callingAppId, targetAppId);
     }
 
     public static boolean shouldConcealDevSettings(int callingAppId) {
-        return sCurrent.concealsDevSettings(callingAppId);
+        final YasvaraTabirPolicy p = sCurrent;
+        return p.mDevHideMode != DEV_HIDE_OFF && p.concealsDevSettings(callingAppId);
+    }
+
+    /**
+     * Fast-path gate for {@code ComputerEngine.stripXposedMetaData}: avoids unparceling component
+     * {@code metaData} Bundles unless {@code hideXposed} is active, the target is a known Xposed
+     * module, and the caller is a non-exempt user app.
+     */
+    public static boolean shouldStripXposedMetaData(int callingAppId, int targetAppId) {
+        final YasvaraTabirPolicy p = sCurrent;
+        return !p.mXposedModuleAppIds.isEmpty() && p.stripsXposedMetaData(callingAppId, targetAppId);
     }
 
     public static boolean isDevConcealedGlobalKey(String name) {
@@ -131,7 +264,18 @@ public final class YasvaraTabirPolicy {
     }
 
     public int globalHiddenCount() {
-        return mGlobalHiddenAppIds.length + mGlobalHiddenRomPackages.length;
+        return mGlobalHiddenAppIds.size() + mGlobalHiddenRomPackages.size();
+    }
+
+    public boolean stripsXposedMetaData(int callingAppId, int targetAppId) {
+        if (mXposedModuleAppIds.isEmpty()) return false;
+        if (callingAppId < FIRST_APPLICATION_UID || callingAppId > LAST_APPLICATION_UID) {
+            return false;
+        }
+        if (callingAppId == targetAppId || !mXposedModuleAppIds.contains(targetAppId)) {
+            return false;
+        }
+        return !mExemptCallers.contains(callingAppId);
     }
 
     public boolean hidesUid(int callingAppId, int targetAppId) {
@@ -143,22 +287,21 @@ public final class YasvaraTabirPolicy {
             return false;
         }
 
-        if (mOverrideCallers.length > 0) {
+        if (mOverrideCallerSet.contains(callingAppId)) {
             int idx = Arrays.binarySearch(mOverrideCallers, callingAppId);
             if (idx >= 0) {
-                if (contains(mExemptCallers, callingAppId)) return false;
                 int mode = mOverrideModes[idx];
                 if (mode == MODE_BLACKLIST) {
-                    return contains(mOverrideAppIds[idx], targetAppId);
+                    return mOverrideAppIds[idx].contains(targetAppId);
                 }
                 if (mode == MODE_WHITELIST) {
-                    if (contains(mProtectedSystemAppIds, targetAppId)) return false;
-                    return !contains(mOverrideAppIds[idx], targetAppId);
+                    if (mProtectedSystemAppIds.contains(targetAppId)) return false;
+                    return !mOverrideAppIds[idx].contains(targetAppId);
                 }
             }
         }
 
-        if (!contains(mGlobalHiddenAppIds, targetAppId)) return false;
+        if (!mGlobalHiddenAppIds.contains(targetAppId)) return false;
         return isGlobalObserver(callingAppId);
     }
 
@@ -170,59 +313,54 @@ public final class YasvaraTabirPolicy {
         if (callingAppId == targetAppId) {
             return false;
         }
-        if ("android".equals(targetPkg)) {
-            return false;
-        }
 
         // Shared system UID targets (e.g. uid 1000 for org.lineageos.lineageparts) can ONLY be
         // hidden by exact package-name match so "android" and core system packages stay intact.
         if (targetAppId < FIRST_APPLICATION_UID) {
-            if (targetPkg == null) return false;
-            if (mOverrideCallers.length > 0) {
+            if (targetPkg == null || "android".equals(targetPkg)) return false;
+            if (mOverrideCallerSet.contains(callingAppId)) {
                 int idx = Arrays.binarySearch(mOverrideCallers, callingAppId);
                 if (idx >= 0) {
-                    if (contains(mExemptCallers, callingAppId)) return false;
                     int mode = mOverrideModes[idx];
                     if (mode == MODE_BLACKLIST) {
-                        return contains(mOverrideRomPackages[idx], targetPkg);
+                        return mOverrideRomPackages[idx].contains(targetPkg);
                     }
                     if (mode == MODE_WHITELIST) {
-                        return contains(mKnownHideableRomPackages, targetPkg)
-                                && !contains(mOverrideRomPackages[idx], targetPkg);
+                        return mKnownHideableRomPackages.contains(targetPkg)
+                                && !mOverrideRomPackages[idx].contains(targetPkg);
                     }
                 }
             }
-            if (!contains(mGlobalHiddenRomPackages, targetPkg)) return false;
+            if (!mGlobalHiddenRomPackages.contains(targetPkg)) return false;
             return isGlobalObserver(callingAppId);
         }
 
         // Application UID target (>= 10000).
-        if (mOverrideCallers.length > 0) {
+        if (mOverrideCallerSet.contains(callingAppId)) {
             int idx = Arrays.binarySearch(mOverrideCallers, callingAppId);
             if (idx >= 0) {
-                if (contains(mExemptCallers, callingAppId)) return false;
                 int mode = mOverrideModes[idx];
                 if (mode == MODE_BLACKLIST) {
-                    return contains(mOverrideAppIds[idx], targetAppId)
-                            || (targetPkg != null && contains(mOverrideRomPackages[idx], targetPkg));
+                    return mOverrideAppIds[idx].contains(targetAppId)
+                            || mOverrideRomPackages[idx].contains(targetPkg);
                 }
                 if (mode == MODE_WHITELIST) {
-                    if (contains(mProtectedSystemAppIds, targetAppId)) {
-                        return targetPkg != null
-                                && contains(mKnownHideableRomPackages, targetPkg)
-                                && !contains(mOverrideRomPackages[idx], targetPkg);
+                    if (mProtectedSystemAppIds.contains(targetAppId)) {
+                        return mKnownHideableRomPackages.contains(targetPkg)
+                                && !mOverrideRomPackages[idx].contains(targetPkg);
                     }
-                    if (targetPkg != null && contains(mOverrideRomPackages[idx], targetPkg)) {
+                    if (mOverrideRomPackages[idx].contains(targetPkg)) {
                         return false;
                     }
-                    return !contains(mOverrideAppIds[idx], targetAppId);
+                    return !mOverrideAppIds[idx].contains(targetAppId);
                 }
             }
         }
 
-        boolean globallyHidden = contains(mGlobalHiddenAppIds, targetAppId)
-                || (targetPkg != null && contains(mGlobalHiddenRomPackages, targetPkg));
-        if (!globallyHidden) return false;
+        if (!mGlobalHiddenAppIds.contains(targetAppId)
+                && !mGlobalHiddenRomPackages.contains(targetPkg)) {
+            return false;
+        }
         return isGlobalObserver(callingAppId);
     }
 
@@ -231,26 +369,18 @@ public final class YasvaraTabirPolicy {
         if (callingAppId < FIRST_APPLICATION_UID || callingAppId > LAST_APPLICATION_UID) {
             return false;
         }
-        if (contains(mExemptCallers, callingAppId)) return false;
+        if (mExemptCallers.contains(callingAppId)) return false;
         if (mDevHideMode == DEV_HIDE_ALL_NON_SYSTEM) return true;
         if (mDevHideMode == DEV_HIDE_OBSERVERS) {
-            if (contains(mOverrideCallers, callingAppId)) return true;
-            return isGlobalObserver(callingAppId);
+            if (mOverrideCallerSet.contains(callingAppId)) return true;
+            return mGlobalCallers.contains(callingAppId) != mGlobalDenyByDefault;
         }
         return false;
     }
 
     private boolean isGlobalObserver(int callingAppId) {
-        if (contains(mExemptCallers, callingAppId)) return false;
-        return contains(mGlobalCallers, callingAppId) != mGlobalDenyByDefault;
-    }
-
-    private static boolean contains(int[] sorted, int key) {
-        return sorted.length > 0 && Arrays.binarySearch(sorted, key) >= 0;
-    }
-
-    private static boolean contains(String[] sorted, String key) {
-        return sorted.length > 0 && Arrays.binarySearch(sorted, key) >= 0;
+        if (mExemptCallers.contains(callingAppId)) return false;
+        return mGlobalCallers.contains(callingAppId) != mGlobalDenyByDefault;
     }
 
     private static int[] sortedUnique(int[] values) {
@@ -296,6 +426,7 @@ public final class YasvaraTabirPolicy {
         private int[] mExemptCallers = NO_INTS;
         private int[] mProtectedSystemAppIds = NO_INTS;
         private String[] mKnownHideableRomPackages = NO_STRINGS;
+        private int[] mXposedModuleAppIds = NO_INTS;
         private int[] mOverrideCallers = NO_INTS;
         private int[] mOverrideModes = NO_INTS;
         private int[][] mOverrideAppIds = NO_INT_MATRIX;
@@ -333,6 +464,11 @@ public final class YasvaraTabirPolicy {
         public Builder setKnownHideableRomPackages(String[] knownHideableRomPackages) {
             mKnownHideableRomPackages =
                     knownHideableRomPackages != null ? knownHideableRomPackages : NO_STRINGS;
+            return this;
+        }
+
+        public Builder setXposedModuleAppIds(int[] xposedModuleAppIds) {
+            mXposedModuleAppIds = xposedModuleAppIds != null ? xposedModuleAppIds : NO_INTS;
             return this;
         }
 

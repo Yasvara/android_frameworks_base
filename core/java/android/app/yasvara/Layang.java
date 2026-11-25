@@ -40,6 +40,8 @@ public final class Layang {
     public static final String OPT_MINI = "mini";
     /** Rect: where the open animation morphs from (icon, card, notification). */
     public static final String OPT_SOURCE_BOUNDS = "source_bounds";
+    /** String: package hint for a pre-launch source-bounds handoff to Shell. */
+    public static final String OPT_SOURCE_PKG = "source_pkg";
 
     // ---- Per-app rules (ILayangManager#getRules / setRules) ----
     /** boolean: launches of this app always open floating. */
@@ -54,6 +56,10 @@ public final class Layang {
     public static final String RULE_SIZE = "size";
     /** boolean: treat as a game even without CATEGORY_GAME (or never, when false). */
     public static final String RULE_GAME = "game";
+    /** int: per-app floating FPS cap (0 = auto/uncapped, else 30/45/60/90/120). */
+    public static final String RULE_FPS = "fps";
+    /** float: per-app virtual/render resolution scale (1.0 = native, else 0.85/0.75/0.60). */
+    public static final String RULE_RES_SCALE = "res_scale";
     /** boolean, setRules only: forget the remembered position and size. */
     public static final String RULE_RESET_GEOMETRY = "reset_geometry";
 
@@ -68,6 +74,8 @@ public final class Layang {
     public static final String KEY_GHOST_ALPHA = "yasvara_layang_ghost_alpha";
     /** Thickness of the resize handles in dp, 2/3 outside the window and 1/3 inside. */
     public static final String KEY_GRIP_DP = "yasvara_layang_grip_dp";
+    /** Width of a mini (bubble) window along its short side in dp (72..140, default 96). */
+    public static final String KEY_MINI_WIDTH_DP = "yasvara_layang_mini_width_dp";
     public static final String KEY_REMEMBER = "yasvara_layang_remember";
 
     // ---- Geometry (§4.1, §6.4) ----
@@ -83,8 +91,14 @@ public final class Layang {
     public static final int GRIP_DP_DEFAULT = 24;
     public static final int GRIP_DP_MIN = 16;
     public static final int GRIP_DP_MAX = 40;
-    /** Width of a mini window in dp. */
+    /** Width of a mini window in dp (legacy constant kept for binary compatibility). */
     public static final int MINI_WIDTH_DP = 132;
+    /** Default, minimum and maximum short-side width of a mini/bubble window in dp. */
+    public static final int MINI_WIDTH_DP_DEFAULT = 96;
+    public static final int MINI_WIDTH_DP_MIN = 72;
+    public static final int MINI_WIDTH_DP_MAX = 140;
+    /** Maximum long/short aspect ratio of a mini window so 9:20 apps stay compact bubbles. */
+    public static final float MINI_MAX_ASPECT = 1.65f;
     /** Screen margin of placement in dp. */
     public static final int MARGIN_DP = 12;
     /**

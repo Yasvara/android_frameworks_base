@@ -639,7 +639,7 @@ public class DisplayPolicy {
 
                 @Override
                 public void onSwipeFromRight() {
-                    if (pentasGameFocused()) return;
+                    if (pentasGameFocused() || isLayangFocused()) return;
                     final Region excludedRegion = Region.obtain();
                     synchronized (mLock) {
                         mDisplayContent.calculateSystemGestureExclusion(
@@ -655,7 +655,7 @@ public class DisplayPolicy {
 
                 @Override
                 public void onSwipeFromLeft() {
-                    if (pentasGameFocused()) return;
+                    if (pentasGameFocused() || isLayangFocused()) return;
                     final Region excludedRegion = Region.obtain();
                     synchronized (mLock) {
                         mDisplayContent.calculateSystemGestureExclusion(
@@ -2728,6 +2728,17 @@ public class DisplayPolicy {
         if (game == null) return false;
         synchronized (mLock) {
             return mFocusedWindow != null && game.equals(mFocusedWindow.getOwningPackage());
+        }
+    }
+
+    /**
+     * Whether the focused window belongs to a Layang floating task. Side edge swipes must route
+     * Back to the floating window without summoning the underlying fullscreen app's transient bars.
+     */
+    private boolean isLayangFocused() {
+        synchronized (mLock) {
+            return mFocusedWindow != null && mFocusedWindow.mActivityRecord != null
+                    && LayangCore.isLayang(mFocusedWindow.mActivityRecord);
         }
     }
 

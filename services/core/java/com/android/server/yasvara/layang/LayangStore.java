@@ -74,16 +74,21 @@ final class LayangStore {
         @Nullable String size;
         /** -1 auto (category/Pentas), 0 never a game, 1 always a game. */
         int game = -1;
+        /** Per-app floating FPS cap (0 = auto/uncapped, else 30/45/60/90/120). */
+        int fps;
+        /** Per-app virtual/render resolution scale (0 or 1 = native, else 0.5..0.95). */
+        float resScale;
         final Geometry[] geometry = new Geometry[2];
 
         boolean isEmpty() {
             return !always && !blocked && readable < 0 && aspectLock < 0 && size == null
-                    && game < 0 && geometry[0] == null && geometry[1] == null;
+                    && game < 0 && fps <= 0 && (resScale <= 0f || resScale >= 0.99f)
+                    && geometry[0] == null && geometry[1] == null;
         }
 
         boolean hasRules() {
             return always || blocked || readable >= 0 || aspectLock >= 0 || size != null
-                    || game >= 0;
+                    || game >= 0 || fps > 0 || (resScale > 0f && resScale < 0.99f);
         }
     }
 
@@ -142,6 +147,22 @@ final class LayangStore {
         }
     }
 
+    /** Packages with always-open-floating enabled (RULE_ALWAYS). */
+    @NonNull
+    android.util.ArraySet<String> alwaysPackages(int userId) {
+        synchronized (mLock) {
+            final ArrayMap<String, App> apps = userLocked(userId);
+            final android.util.ArraySet<String> out = new android.util.ArraySet<>();
+            for (int i = 0; i < apps.size(); i++) {
+                final App a = apps.valueAt(i);
+                if (a.always && !a.blocked) {
+                    out.add(apps.keyAt(i));
+                }
+            }
+            return out;
+        }
+    }
+
     /** Packages forced to be games (1) or never games (0) by a rule. */
     @NonNull
     ArrayMap<String, Integer> gameRules(int userId) {
@@ -182,6 +203,8 @@ final class LayangStore {
                 if (a.aspectLock >= 0) sb.append(" aspectLock=").append(a.aspectLock);
                 if (a.size != null) sb.append(" size=").append(a.size);
                 if (a.game >= 0) sb.append(" game=").append(a.game);
+                if (a.fps > 0) sb.append(" fps=").append(a.fps);
+                if (a.resScale > 0f && a.resScale < 0.99f) sb.append(" res=").append(a.resScale);
                 for (int o = 0; o < 2; o++) {
                     final Geometry g = a.geometry[o];
                     if (g != null) {
@@ -216,6 +239,8 @@ final class LayangStore {
         c.aspectLock = a.aspectLock;
         c.size = a.size;
         c.game = a.game;
+        c.fps = a.fps;
+        c.resScale = a.resScale;
         for (int o = 0; o < 2; o++) {
             c.geometry[o] = a.geometry[o] != null ? a.geometry[o].copy() : null;
         }
@@ -271,6 +296,8 @@ final class LayangStore {
         if (a.aspectLock >= 0) xml.attributeInt(null, "aspectLock", a.aspectLock);
         if (a.size != null) xml.attribute(null, "size", a.size);
         if (a.game >= 0) xml.attributeInt(null, "game", a.game);
+        if (a.fps > 0) xml.attributeInt(null, "fps", a.fps);
+        if (a.resScale > 0f && a.resScale < 0.99f) xml.attributeFloat(null, "resScale", a.resScale);
         for (int o = 0; o < 2; o++) {
             final Geometry g = a.geometry[o];
             if (g == null) continue;
@@ -312,6 +339,8 @@ final class LayangStore {
                         app.aspectLock = xml.getAttributeInt(null, "aspectLock", -1);
                         app.size = xml.getAttributeValue(null, "size");
                         app.game = xml.getAttributeInt(null, "game", -1);
+                        app.fps = xml.getAttributeInt(null, "fps", 0);
+                        app.resScale = xml.getAttributeFloat(null, "resScale", 0f);
                         apps.put(pkg, app);
                         break;
                     }

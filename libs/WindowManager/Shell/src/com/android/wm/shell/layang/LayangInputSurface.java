@@ -33,7 +33,8 @@ import java.util.function.Consumer;
  * A bufferless input surface of a Layang window: the corner grips, and the
  * shield that takes every touch of a mini window. It is a container layer, so it costs no
  * composition, and its touch region moves with the surface, so a gesture needs no binder call
- * per frame. Set up on the background thread like the desktop DragResizeInputListener.
+ * per frame. Both channel grant and region updates run off the Shell main thread to avoid
+ * blocking animations or gesture dispatch.
  */
 final class LayangInputSurface {
     private static final String TAG = "LayangInputSurface";
@@ -45,10 +46,12 @@ final class LayangInputSurface {
     private final SurfaceControl mSurface;
     private final IBinder mClientToken = new Binder();
     private final Consumer<MotionEvent> mOnTouch;
+    private final Region mLastRegion = new Region();
 
     @Nullable private Receiver mReceiver;
     @Nullable private Region mPendingRegion;
-    private boolean mClosed;
+    private boolean mHasLastRegion;
+    private volatile boolean mClosed;
 
     LayangInputSurface(@NonNull IWindowSession session, @NonNull ShellExecutor mainExecutor,
             @NonNull ShellExecutor bgExecutor, int displayId, @NonNull SurfaceControl parent,
@@ -68,17 +71,19 @@ final class LayangInputSurface {
         bgExecutor.execute(() -> {
             InputChannel channel = null;
             try {
-                final WindowInputChannelParams params = new WindowInputChannelParams();
-                params.displayId = mDisplayId;
-                params.surface = surfaceCopy;
-                params.clientToken = mClientToken;
-                params.inputTransferToken = new InputTransferToken();
-                params.type = TYPE_APPLICATION;
-                params.flags = FLAG_NOT_FOCUSABLE;
-                params.privateFlags = PRIVATE_FLAG_TRUSTED_OVERLAY;
-                params.inputHandleName = name;
-                params.region = new Region();
-                channel = mSession.grantInputChannel(params);
+                if (!mClosed) {
+                    final WindowInputChannelParams params = new WindowInputChannelParams();
+                    params.displayId = mDisplayId;
+                    params.surface = surfaceCopy;
+                    params.clientToken = mClientToken;
+                    params.inputTransferToken = new InputTransferToken();
+                    params.type = TYPE_APPLICATION;
+                    params.flags = FLAG_NOT_FOCUSABLE;
+                    params.privateFlags = PRIVATE_FLAG_TRUSTED_OVERLAY;
+                    params.inputHandleName = name;
+                    params.region = new Region();
+                    channel = mSession.grantInputChannel(params);
+                }
             } catch (RemoteException e) {
                 Log.e(TAG, "grantInputChannel failed", e);
             } finally {
@@ -96,8 +101,9 @@ final class LayangInputSurface {
                 }
                 mReceiver = new Receiver(granted, Looper.myLooper());
                 if (mPendingRegion != null) {
-                    setRegion(mPendingRegion);
+                    final Region pending = mPendingRegion;
                     mPendingRegion = null;
+                    setRegion(pending);
                 }
             });
         });
@@ -108,27 +114,42 @@ final class LayangInputSurface {
         return mSurface;
     }
 
-    /** Touchable region in this surface's coordinates. One binder call; not per frame. */
+    /** Touchable region in this surface's coordinates. Deduplicated and dispatched off-main. */
     void setRegion(@NonNull Region region) {
-        if (mClosed) {
+        if (mClosed || !mSurface.isValid()) {
             return;
         }
         if (mReceiver == null) {
             mPendingRegion = new Region(region);
             return;
         }
-        final WindowInputChannelParams params = new WindowInputChannelParams();
-        params.displayId = mDisplayId;
-        params.channelToken = mReceiver.getToken();
-        params.surface = mSurface;
-        params.flags = FLAG_NOT_FOCUSABLE;
-        params.privateFlags = PRIVATE_FLAG_TRUSTED_OVERLAY;
-        params.region = new Region(region);
-        try {
-            mSession.updateInputChannel(params);
-        } catch (RemoteException e) {
-            Log.e(TAG, "updateInputChannel failed", e);
+        if (mHasLastRegion && mLastRegion.equals(region)) {
+            return;
         }
+        mLastRegion.set(region);
+        mHasLastRegion = true;
+        final IBinder token = mReceiver.getToken();
+        final Region copy = new Region(region);
+        final SurfaceControl surfaceCopy = new SurfaceControl(mSurface, "LayangInputSurface.upd");
+        mBgExecutor.execute(() -> {
+            try {
+                if (mClosed) {
+                    return;
+                }
+                final WindowInputChannelParams params = new WindowInputChannelParams();
+                params.displayId = mDisplayId;
+                params.channelToken = token;
+                params.surface = surfaceCopy;
+                params.flags = FLAG_NOT_FOCUSABLE;
+                params.privateFlags = PRIVATE_FLAG_TRUSTED_OVERLAY;
+                params.region = copy;
+                mSession.updateInputChannel(params);
+            } catch (RemoteException e) {
+                Log.e(TAG, "updateInputChannel failed", e);
+            } finally {
+                surfaceCopy.release();
+            }
+        });
     }
 
     void close(@NonNull SurfaceControl.Transaction t) {
@@ -140,7 +161,10 @@ final class LayangInputSurface {
             mReceiver.dispose();
             mReceiver = null;
         }
-        t.remove(mSurface);
+        if (mSurface.isValid()) {
+            t.remove(mSurface);
+            mSurface.release();
+        }
         mBgExecutor.execute(() -> {
             try {
                 mSession.remove(mClientToken);

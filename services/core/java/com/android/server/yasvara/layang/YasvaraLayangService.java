@@ -92,6 +92,8 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
 
     /** Pentas's game list per user. */
     private final SparseArray<ArraySet<String>> mPentasGames = new SparseArray<>();
+    /** Cached pkg -> label per user so snapshotWindows avoids repeated PM/Context queries. */
+    private final SparseArray<ArrayMap<String, String>> mLabelCache = new SparseArray<>();
 
     /** Last window list sent to listeners. */
     private List<LayangWindowInfo> mWindows = Collections.emptyList();
@@ -112,6 +114,21 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         mStore = new LayangStore(mHandler);
         mPressure = new LayangPressureWatcher(() -> mHandler.post(this::onFullPressure));
         LayangCore.setChangeCallback(() -> mHandler.post(this::onWindowsChanged));
+        LayangCore.setAlwaysLaunchResolver((pkg, userId, ai, dw, dh, dpi, topInset) -> {
+            if (!isEnabled()) return null;
+            final LayangStore.App rules = mStore.get(userId, pkg);
+            if (rules == null || !rules.always || rules.blocked) return null;
+            final boolean game = isGameInternal(pkg, userId);
+            final Placement p = computePlacementForDisplay(pkg, userId, game,
+                    wantsLandscape(ai, game, dw > dh), isFixedOrientation(ai), null,
+                    dw, dh, dpi, topInset);
+            final ActivityOptions o = ActivityOptions.makeBasic();
+            o.setLaunchWindowingMode(WINDOWING_MODE_FREEFORM);
+            o.setLaunchBounds(p.bounds);
+            o.setLayangLaunch(p.state);
+            o.setLaunchDisplayId(Display.DEFAULT_DISPLAY);
+            return o;
+        });
 
         final IntentFilter filter = new IntentFilter(Intent.ACTION_USER_REMOVED);
         mContext.registerReceiverAsUser(new BroadcastReceiver() {
@@ -122,7 +139,9 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
                     mStore.onUserRemoved(userId);
                     synchronized (mLock) {
                         mPentasGames.remove(userId);
+                        mLabelCache.remove(userId);
                     }
+                    LayangCore.setAlwaysPackages(userId, Collections.emptySet());
                 }
             }
         }, UserHandle.ALL, filter, null, mHandler);
@@ -135,7 +154,10 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
                         loadPentasGames(ActivityManager.getCurrentUser());
                     }
                 }, UserHandle.USER_ALL);
-        mHandler.post(() -> loadPentasGames(UserHandle.USER_SYSTEM));
+        mHandler.post(() -> {
+            loadPentasGames(UserHandle.USER_SYSTEM);
+            pushAlwaysToCore(UserHandle.USER_SYSTEM);
+        });
 
         mContext.getContentResolver().registerContentObserver(
                 Settings.Secure.getUriFor(Layang.KEY_ENABLED), false,
@@ -292,6 +314,8 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         b.putInt(Layang.RULE_ASPECT_LOCK, a.aspectLock);
         if (a.size != null) b.putString(Layang.RULE_SIZE, a.size);
         if (a.game >= 0) b.putBoolean(Layang.RULE_GAME, a.game == 1);
+        b.putInt(Layang.RULE_FPS, a.fps);
+        b.putFloat(Layang.RULE_RES_SCALE, a.resScale > 0f ? a.resScale : 1f);
         return b;
     }
 
@@ -352,7 +376,7 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
             if (mode == LayangTaskState.MODE_MINI) {
                 final int[] d = LayangCore.getDefaultDisplayInfo();
                 final Rect mini = new Rect();
-                LayangGeometry.mini(p.bounds, d[0], d[1], d[2], topInset(), mini);
+                computeMiniBounds(p.bounds, d[0], d[1], d[2], topInset(), miniWidthDp(user), mini);
                 return mini;
             }
             return p.bounds;
@@ -402,9 +426,25 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         if (opts != null && opts.getBoolean(Layang.OPT_MINI)) {
             final int[] d = LayangCore.getDefaultDisplayInfo();
             final Rect mini = new Rect();
-            LayangGeometry.mini(bounds, d[0], d[1], d[2], topInset(), mini);
+            computeMiniBounds(bounds, d[0], d[1], d[2], topInset(), miniWidthDp(userId), mini);
             bounds = mini;
             state = state.withMode(LayangTaskState.MODE_MINI);
+        }
+
+        // Handoff icon source bounds to Shell before startActivity so cold-start open transitions
+        // pop up smoothly out of the Pentas sidebar / Launcher icon (binary-compatible sentinel).
+        if (opts != null) {
+            final Rect src = opts.getParcelable(Layang.OPT_SOURCE_BOUNDS, Rect.class);
+            final ILayangShell sh = shell();
+            if (src != null && !src.isEmpty() && sh != null) {
+                try {
+                    final Bundle hint = new Bundle();
+                    hint.putString(Layang.OPT_SOURCE_PKG, pkg);
+                    hint.putParcelable(Layang.OPT_SOURCE_BOUNDS, src);
+                    sh.enterLayang(-1, state, src, hint);
+                } catch (RemoteException ignored) {
+                }
+            }
         }
 
         final ActivityOptions o = ActivityOptions.makeBasic();
@@ -459,7 +499,9 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         final ILayangShell shell = shell();
         if (shell != null) {
             try {
-                shell.enterLayang(taskId, p.state, p.bounds, opts != null ? opts : new Bundle());
+                final Bundle shellOpts = opts != null ? new Bundle(opts) : new Bundle();
+                shellOpts.putString(Layang.OPT_SOURCE_PKG, pkg);
+                shell.enterLayang(taskId, p.state, p.bounds, shellOpts);
                 return Layang.RESULT_OK;
             } catch (RemoteException e) {
                 Slog.w(TAG, "Shell enterLayang failed; applying in core", e);
@@ -494,9 +536,19 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         o.setLaunchDisplayId(Display.DEFAULT_DISPLAY);
         o.setPendingIntentBackgroundActivityStartMode(
                 ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_ALWAYS);
+        boolean hasFloatingTask = false;
+        for (LayangWindowInfo w : LayangCore.getWindows()) {
+            if (w.userId == userId && pkg.equals(w.packageName)) {
+                hasFloatingTask = true;
+                break;
+            }
+        }
         try {
-            pi.send(mContext, 0, new Intent().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                    | Intent.FLAG_ACTIVITY_MULTIPLE_TASK), null, null, null, o.toBundle());
+            int flags = Intent.FLAG_ACTIVITY_NEW_TASK;
+            if (!hasFloatingTask) {
+                flags |= Intent.FLAG_ACTIVITY_MULTIPLE_TASK;
+            }
+            pi.send(mContext, 0, new Intent().addFlags(flags), null, null, null, o.toBundle());
         } catch (PendingIntent.CanceledException | RuntimeException e) {
             Slog.w(TAG, "openPendingIntent failed", e);
             return Layang.RESULT_FAILED;
@@ -523,19 +575,25 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
     Placement computePlacement(@NonNull String pkg, int userId, boolean game, boolean landscape,
             boolean fixed, @Nullable Bundle opts) {
         final int[] d = LayangCore.getDefaultDisplayInfo();
-        final int dw = d[0];
-        final int dh = d[1];
-        final int dpi = d[2];
+        return computePlacementForDisplay(pkg, userId, game, landscape, fixed, opts,
+                d[0], d[1], d[2], topInset());
+    }
+
+    @NonNull
+    private Placement computePlacementForDisplay(@NonNull String pkg, int userId, boolean game,
+            boolean landscape, boolean fixed, @Nullable Bundle opts,
+            int dw, int dh, int dpi, int topInset) {
         final int dLong = Math.max(dw, dh);
         final int dShort = Math.min(dw, dh);
         final int margin = LayangGeometry.dpToPx(Layang.MARGIN_DP, dpi);
-        final int topInset = topInset();
         final LayangStore.App app = mStore.get(userId, pkg);
         final boolean remember = secureInt(Layang.KEY_REMEMBER, 1, userId) != 0;
         // Remembered per display orientation (see rememberGeometry).
         final int orient = dw > dh ? LayangStore.ORIENT_LANDSCAPE : LayangStore.ORIENT_PORTRAIT;
         final LayangStore.Geometry g = remember && app != null ? app.geometry[orient] : null;
         final boolean reflow = app != null && app.readable == 1;
+        final float resScale = (!reflow && app != null && app.resScale >= 0.5f
+                && app.resScale < 0.99f) ? app.resScale : 1f;
 
         final Placement p = new Placement();
         int flags = game ? LayangTaskState.FLAG_GAME : 0;
@@ -590,13 +648,18 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
             if (opts != null && opts.containsKey(Layang.OPT_SCALE)) {
                 scale = opts.getFloat(Layang.OPT_SCALE);
             }
-            final int vl = Math.max(vw, vh);
-            final int vs = Math.min(vw, vh);
+            int vl = Math.max(vw, vh);
+            int vs = Math.min(vw, vh);
+            LayangGeometry.gameSize(vl, vs, vw > vh, scale, dw, dh, margin, wh);
+            if (resScale < 0.99f) {
+                vl = Math.max(320, Math.round(vl * resScale));
+                vs = Math.max(320, Math.round(vs * resScale));
+                density = Math.max(120, Math.round(dpi * resScale));
+            }
             if (Math.abs(vl - dLong) > 2 || Math.abs(vs - dShort) > 2) {
                 vLong = vl;
                 vShort = vs;
             }
-            LayangGeometry.gameSize(vl, vs, vw > vh, scale, dw, dh, margin, wh);
         }
         float cx = g != null ? g.cx : -1f;
         float cy = g != null ? g.cy : -1f;
@@ -622,11 +685,56 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         return Layang.APP_SCALE_M;
     }
 
-    private static boolean wantsLandscape(@NonNull ActivityInfo ai, boolean game) {
+    private static boolean wantsLandscape(@NonNull ActivityInfo ai, boolean game,
+            boolean displayLandscape) {
         if (ActivityInfo.isFixedOrientationLandscape(ai.screenOrientation)) return true;
         if (ActivityInfo.isFixedOrientationPortrait(ai.screenOrientation)) return false;
         // A free app opens upright like on the home screen, even over a landscape game.
-        return game && isDisplayLandscape();
+        return game && displayLandscape;
+    }
+
+    private static boolean wantsLandscape(@NonNull ActivityInfo ai, boolean game) {
+        return wantsLandscape(ai, game, isDisplayLandscape());
+    }
+
+    private int miniWidthDp(int userId) {
+        final int v = secureInt(Layang.KEY_MINI_WIDTH_DP, Layang.MINI_WIDTH_DP_DEFAULT, userId);
+        return Math.max(Layang.MINI_WIDTH_DP_MIN, Math.min(Layang.MINI_WIDTH_DP_MAX, v));
+    }
+
+    /** Compact mini/bubble placement honoring user-configured width dp without letterboxing. */
+    private static void computeMiniBounds(@NonNull Rect from, int displayW, int displayH,
+            int densityDpi, int topInset, int miniWidthDp, @NonNull Rect out) {
+        final int margin = LayangGeometry.dpToPx(Layang.MARGIN_DP, densityDpi);
+        final int miniW = LayangGeometry.dpToPx(miniWidthDp, densityDpi);
+        final float aspect = from.width() > 0 ? (float) from.height() / from.width() : 1f;
+        int w;
+        int h;
+        if (aspect >= 1f) {
+            w = miniW;
+            h = Math.round(miniW * aspect);
+            final int maxH = Math.round(displayH * 0.28f);
+            if (h > maxH && maxH > 0) {
+                final float shrink = (float) maxH / h;
+                h = maxH;
+                w = Math.max(LayangGeometry.dpToPx(56, densityDpi), Math.round(w * shrink));
+            }
+        } else {
+            h = miniW;
+            w = Math.round(miniW / aspect);
+            final int maxW = Math.round(displayW * 0.34f);
+            if (w > maxW && maxW > 0) {
+                final float shrink = (float) maxW / w;
+                w = maxW;
+                h = Math.max(LayangGeometry.dpToPx(56, densityDpi), Math.round(h * shrink));
+            }
+        }
+        final boolean right = from.centerX() >= displayW / 2;
+        final boolean bottom = from.centerY() >= displayH / 2;
+        final int left = right ? displayW - margin - w : margin;
+        final int top = bottom ? displayH - margin - h : Math.max(margin, topInset);
+        out.set(left, top, left + w, top + h);
+        LayangGeometry.clamp(out, displayW, displayH, margin, topInset);
     }
 
     private static boolean isFixedOrientation(@NonNull ActivityInfo ai) {
@@ -672,7 +780,8 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         final int[] d = LayangCore.getDefaultDisplayInfo();
         if (mode == LayangTaskState.MODE_MINI) {
             final Rect mini = new Rect();
-            LayangGeometry.mini(bounds, d[0], d[1], d[2], topInset(), mini);
+            computeMiniBounds(bounds, d[0], d[1], d[2], topInset(),
+                    miniWidthDp(UserHandle.USER_CURRENT), mini);
             wct.setBounds(token, mini);
         } else if (mode == LayangTaskState.MODE_FLOATING) {
             final ActivityManager.RunningTaskInfo info = getTaskInfo(taskId);
@@ -788,13 +897,33 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
                 final Object v = rules.get(Layang.RULE_GAME);
                 a.game = v instanceof Boolean ? (((Boolean) v) ? 1 : 0) : -1;
             }
+            if (rules.containsKey(Layang.RULE_FPS)) {
+                final int fps = rules.getInt(Layang.RULE_FPS, 0);
+                a.fps = fps <= 0 ? 0 : Math.max(15, Math.min(144, fps));
+            }
+            if (rules.containsKey(Layang.RULE_RES_SCALE)) {
+                final float rs = rules.getFloat(Layang.RULE_RES_SCALE, 1f);
+                a.resScale = (rs <= 0f || rs >= 0.99f) ? 0f : Math.max(0.5f, Math.min(0.95f, rs));
+            }
             if (rules.getBoolean(Layang.RULE_RESET_GEOMETRY)) {
                 a.geometry[0] = null;
                 a.geometry[1] = null;
             }
         });
+        if (rules.containsKey(Layang.RULE_ALWAYS) || rules.containsKey(Layang.RULE_BLOCKED)) {
+            pushAlwaysToCore(userId);
+        }
         if (rules.containsKey(Layang.RULE_GAME)) {
             pushGamesToCore(userId);
+        }
+        if (rules.containsKey(Layang.RULE_FPS)) {
+            mHandler.post(() -> updateFrameRates(LayangCore.getWindows()));
+        }
+        if (rules.containsKey(Layang.RULE_RES_SCALE)) {
+            final float rs = rules.getFloat(Layang.RULE_RES_SCALE, 1f);
+            final float clamped = (rs <= 0f || rs >= 0.99f) ? 1f
+                    : Math.max(0.5f, Math.min(0.95f, rs));
+            mHandler.post(() -> applyResolutionScale(pkg, userId, clamped));
         }
         if (rules.getBoolean(Layang.RULE_BLOCKED)) {
             for (LayangWindowInfo w : LayangCore.getWindows()) {
@@ -802,6 +931,54 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
                     toFullscreenInternal(w.taskId);
                 }
             }
+        }
+    }
+
+    private void pushAlwaysToCore(int userId) {
+        LayangCore.setAlwaysPackages(userId, mStore.alwaysPackages(userId));
+    }
+
+    /**
+     * Applies resolution scale live to any open Layang window of pkg (adjusting its virtual screen
+     * V and proportional density) and, for games, also writes the GameManager downscale override.
+     */
+    private void applyResolutionScale(@NonNull String pkg, int userId, float scale) {
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            if (isGameInternal(pkg, userId)) {
+                try {
+                    final android.app.IGameManagerService gms =
+                            android.app.IGameManagerService.Stub.asInterface(
+                                    android.os.ServiceManager.getService(Context.GAME_SERVICE));
+                    if (gms != null) {
+                        gms.updateResolutionScalingFactor(pkg,
+                                android.app.GameManager.GAME_MODE_CUSTOM, scale, userId);
+                    }
+                } catch (Throwable t) {
+                    Slog.w(TAG, "GameManager resolution scaling update failed for " + pkg, t);
+                }
+            }
+            final int[] d = LayangCore.getDefaultDisplayInfo();
+            final int dLong = Math.max(d[0], d[1]);
+            final int dShort = Math.min(d[0], d[1]);
+            final int dpi = d[2];
+            for (LayangWindowInfo w : LayangCore.getWindows()) {
+                if (w.userId != userId || !pkg.equals(w.packageName)) continue;
+                if (w.state.hasFlag(LayangTaskState.FLAG_REFLOW)) continue;
+                final WindowContainerToken token = LayangCore.getRootTaskToken(w.taskId);
+                if (token == null) continue;
+                final int vl = scale >= 0.99f ? 0 : Math.max(320, Math.round(dLong * scale));
+                final int vs = scale >= 0.99f ? 0 : Math.max(320, Math.round(dShort * scale));
+                final int nextDpi = scale >= 0.99f ? 0 : Math.max(120, Math.round(dpi * scale));
+                final LayangTaskState next = w.state.withVirtualSize(vl, vs).withDensity(nextDpi);
+                if (!next.equals(w.state)) {
+                    final WindowContainerTransaction wct = new WindowContainerTransaction();
+                    wct.setLayangState(token, next);
+                    LayangCore.applyTransaction(wct, w.taskId);
+                }
+            }
+        } finally {
+            Binder.restoreCallingIdentity(ident);
         }
     }
 
@@ -874,18 +1051,39 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         for (LayangWindowInfo w : raw) {
             String label = w.label;
             if (label == null || label.isEmpty()) {
-                try {
-                    final PackageManager pm = userPm(w.userId);
-                    label = pm.getApplicationLabel(pm.getApplicationInfo(w.packageName,
-                            PackageManager.ApplicationInfoFlags.of(0))).toString();
-                } catch (PackageManager.NameNotFoundException e) {
-                    label = w.packageName;
-                }
+                label = cachedLabel(w.userId, w.packageName);
             }
             out.add(new LayangWindowInfo(w.taskId, w.userId, w.packageName, label, w.state,
                     w.bounds, w.focused, w.visible, w.lastInteraction));
         }
         return out;
+    }
+
+    @NonNull
+    private String cachedLabel(int userId, @NonNull String pkg) {
+        synchronized (mLock) {
+            final ArrayMap<String, String> map = mLabelCache.get(userId);
+            if (map != null) {
+                final String hit = map.get(pkg);
+                if (hit != null) return hit;
+            }
+        }
+        String label = pkg;
+        try {
+            final PackageManager pm = userPm(userId);
+            label = pm.getApplicationLabel(pm.getApplicationInfo(pkg,
+                    PackageManager.ApplicationInfoFlags.of(0))).toString();
+        } catch (PackageManager.NameNotFoundException ignored) {
+        }
+        synchronized (mLock) {
+            ArrayMap<String, String> map = mLabelCache.get(userId);
+            if (map == null) {
+                map = new ArrayMap<>();
+                mLabelCache.put(userId, map);
+            }
+            map.put(pkg, label);
+        }
+        return label;
     }
 
     /** Runs on mHandler after WM core reports a change. */
@@ -895,7 +1093,7 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
             final List<LayangWindowInfo> windows = snapshotWindows();
             rememberGeometry(windows);
             updateSessionPolicies(windows);
-            updateMiniFrameRates(windows);
+            updateFrameRates(windows);
             synchronized (mLock) {
                 mWindows = windows;
             }
@@ -955,37 +1153,47 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
         }
     }
 
-    /** uids currently capped because their game sits in a mini window. */
-    private final ArraySet<Integer> mCappedUids = new ArraySet<>();
+    /** uid -> currently applied Layang frame rate cap (fps > 0). */
+    private final SparseArray<Float> mAppliedFps = new SparseArray<>();
 
     /**
-     * A game in a mini window runs at Settings.Secure yasvara_layang_mini_game_fps (30 by
-     * default, 0 = uncapped) through the per-uid frame-rate override (§5.2, D13).
+     * Applies per-app floating FPS cap (RULE_FPS) and mini-game FPS cap (KEY_MINI_GAME_FPS)
+     * live through SurfaceFlinger's per-uid frame-rate override (§5.2, D13).
      */
-    private void updateMiniFrameRates(@NonNull List<LayangWindowInfo> windows) {
-        final int fps = secureInt(Layang.KEY_MINI_GAME_FPS, 30, UserHandle.USER_CURRENT);
-        final ArraySet<Integer> want = new ArraySet<>();
-        if (fps > 0) {
-            for (LayangWindowInfo w : windows) {
-                if (w.state.isGame() && w.state.getMode() == LayangTaskState.MODE_MINI) {
-                    try {
-                        want.add(mContext.getPackageManager().getPackageUidAsUser(
-                                w.packageName, w.userId));
-                    } catch (PackageManager.NameNotFoundException ignored) {
-                    }
+    private void updateFrameRates(@NonNull List<LayangWindowInfo> windows) {
+        final int miniFps = secureInt(Layang.KEY_MINI_GAME_FPS, 30, UserHandle.USER_CURRENT);
+        final SparseArray<Float> want = new SparseArray<>();
+        for (LayangWindowInfo w : windows) {
+            final int mode = w.state.getMode();
+            if (mode == LayangTaskState.MODE_PARKED) continue;
+            final LayangStore.App app = mStore.get(w.userId, w.packageName);
+            float target = app != null && app.fps > 0 ? app.fps : 0f;
+            if (w.state.isGame() && mode == LayangTaskState.MODE_MINI && miniFps > 0) {
+                target = target > 0f ? Math.min(target, miniFps) : miniFps;
+            }
+            if (target > 0f) {
+                try {
+                    final int uid = mContext.getPackageManager().getPackageUidAsUser(
+                            w.packageName, w.userId);
+                    final Float prev = want.get(uid);
+                    want.put(uid, prev != null ? Math.max(prev, target) : target);
+                } catch (PackageManager.NameNotFoundException ignored) {
                 }
             }
         }
-        for (int i = mCappedUids.size() - 1; i >= 0; i--) {
-            final int uid = mCappedUids.valueAt(i);
-            if (!want.contains(uid)) {
+        for (int i = mAppliedFps.size() - 1; i >= 0; i--) {
+            final int uid = mAppliedFps.keyAt(i);
+            if (want.indexOfKey(uid) < 0) {
                 com.android.server.app.GameManagerService.setLayangFrameRateCap(uid, 0f);
-                mCappedUids.removeAt(i);
+                mAppliedFps.removeAt(i);
             }
         }
         for (int i = 0; i < want.size(); i++) {
-            final int uid = want.valueAt(i);
-            if (mCappedUids.add(uid)) {
+            final int uid = want.keyAt(i);
+            final float fps = want.valueAt(i);
+            final Float cur = mAppliedFps.get(uid);
+            if (cur == null || Math.abs(cur - fps) > 0.1f) {
+                mAppliedFps.put(uid, fps);
                 com.android.server.app.GameManagerService.setLayangFrameRateCap(uid, fps);
             }
         }
@@ -1117,13 +1325,20 @@ public final class YasvaraLayangService extends ILayangManager.Stub {
 
     @Nullable
     private static ActivityManager.RunningTaskInfo findTask(@NonNull String pkg, int userId) {
+        ActivityManager.RunningTaskInfo fallback = null;
         for (ActivityManager.RunningTaskInfo t : runningTasks()) {
             if (t.userId == userId && t.getActivityType() == ACTIVITY_TYPE_STANDARD
                     && t.displayId == Display.DEFAULT_DISPLAY && pkg.equals(packageOf(t))) {
-                return t;
+                // Prefer an active Layang task over a backgrounded singleInstance trampoline task.
+                if (LayangCore.getTaskState(t.taskId) != null) {
+                    return t;
+                }
+                if (fallback == null) {
+                    fallback = t;
+                }
             }
         }
-        return null;
+        return fallback;
     }
 
     @NonNull

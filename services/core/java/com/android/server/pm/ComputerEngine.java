@@ -1524,68 +1524,59 @@ public class ComputerEngine implements Computer {
         packageInfo.setLongVersionCode(Integer.MAX_VALUE);
     }
 
-    private static void stripXposedMetaData(PackageInfo pi, int callingUid) {
-        if (pi == null || UserHandle.getAppId(callingUid) < Process.FIRST_APPLICATION_UID) {
+    private static void stripXposedMetaData(ApplicationInfo ai, int callingUid) {
+        if (ai == null) {
             return;
         }
-        stripXposedMetaData(pi.applicationInfo, callingUid);
+        final int callingAppId = UserHandle.getAppId(callingUid);
+        final int targetAppId = UserHandle.getAppId(ai.uid);
+        if (!YasvaraTabirPolicy.shouldStripXposedMetaData(callingAppId, targetAppId)) {
+            return;
+        }
+        stripXposedMetaDataBundle(ai.metaData);
+    }
+
+    private static void stripXposedMetaData(PackageInfo pi, int callingUid) {
+        if (pi == null || pi.applicationInfo == null) {
+            return;
+        }
+        final int callingAppId = UserHandle.getAppId(callingUid);
+        final int targetAppId = UserHandle.getAppId(pi.applicationInfo.uid);
+        if (!YasvaraTabirPolicy.shouldStripXposedMetaData(callingAppId, targetAppId)) {
+            return;
+        }
+        stripXposedMetaDataBundle(pi.applicationInfo.metaData);
         if (pi.activities != null) {
             for (ActivityInfo ai : pi.activities) {
-                if (ai != null && ai.metaData != null) {
-                    ai.metaData.remove("xposedmodule");
-                    ai.metaData.remove("xposedminversion");
-                    ai.metaData.remove("xposeddescription");
-                    ai.metaData.remove("xposedscope");
-                    ai.metaData.remove("xposedsharedprefs");
-                }
+                if (ai != null) stripXposedMetaDataBundle(ai.metaData);
             }
         }
         if (pi.services != null) {
             for (ServiceInfo si : pi.services) {
-                if (si != null && si.metaData != null) {
-                    si.metaData.remove("xposedmodule");
-                    si.metaData.remove("xposedminversion");
-                    si.metaData.remove("xposeddescription");
-                    si.metaData.remove("xposedscope");
-                    si.metaData.remove("xposedsharedprefs");
-                }
+                if (si != null) stripXposedMetaDataBundle(si.metaData);
             }
         }
         if (pi.receivers != null) {
             for (ActivityInfo ai : pi.receivers) {
-                if (ai != null && ai.metaData != null) {
-                    ai.metaData.remove("xposedmodule");
-                    ai.metaData.remove("xposedminversion");
-                    ai.metaData.remove("xposeddescription");
-                    ai.metaData.remove("xposedscope");
-                    ai.metaData.remove("xposedsharedprefs");
-                }
+                if (ai != null) stripXposedMetaDataBundle(ai.metaData);
             }
         }
         if (pi.providers != null) {
             for (ProviderInfo pri : pi.providers) {
-                if (pri != null && pri.metaData != null) {
-                    pri.metaData.remove("xposedmodule");
-                    pri.metaData.remove("xposedminversion");
-                    pri.metaData.remove("xposeddescription");
-                    pri.metaData.remove("xposedscope");
-                    pri.metaData.remove("xposedsharedprefs");
-                }
+                if (pri != null) stripXposedMetaDataBundle(pri.metaData);
             }
         }
     }
 
-    private static void stripXposedMetaData(ApplicationInfo ai, int callingUid) {
-        if (ai == null || UserHandle.getAppId(callingUid) < Process.FIRST_APPLICATION_UID) {
+    private static void stripXposedMetaDataBundle(Bundle metaData) {
+        if (metaData == null || metaData.isEmpty()) {
             return;
         }
-        if (ai.metaData != null) {
-            ai.metaData.remove("xposedmodule");
-            ai.metaData.remove("xposedminversion");
-            ai.metaData.remove("xposeddescription");
-            ai.metaData.remove("xposedscope");
-            ai.metaData.remove("xposedsharedprefs");
-        }
+        metaData.remove("xposedmodule");
+        metaData.remove("xposedminversion");
+        metaData.remove("xposeddescription");
+        metaData.remove("xposedscope");
+        metaData.remove("xposedsharedprefs");
     }
 
     private static Optional<Signature> generateFakeSignature(AndroidPackage p) {

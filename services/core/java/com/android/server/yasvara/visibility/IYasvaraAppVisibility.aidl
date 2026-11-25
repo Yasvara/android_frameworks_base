@@ -103,4 +103,33 @@ interface IYasvaraAppVisibility {
 
     /** Imports full Tabir configuration from JSON, replacing current rules and persisting. */
     boolean importConfigJson(String json);
+
+    /**
+     * Single-IPC UI snapshot JSON (all settings, lists, detected modules/ROM/root packages,
+     * templates, and observer rules) to eliminate N+1 Binder round-trips in Laras.
+     */
+    String getUiSnapshotJson();
+
+    /**
+     * Single-IPC batch View-As simulation for [observer]: returns JSON with effective mode,
+     * devHidden flag, and per-target hidden booleans without N+1 Binder/PM lookups.
+     */
+    String evaluateObserverJson(String observer);
+
+    /**
+     * Atomically creates/renames/updates a template AND updates which observer apps use it
+     * (HMA-OSS bi-directional template workflow) in a single rebuild + single disk write.
+     */
+    void setTemplateWithAppliedApps(String oldName, String newName, int mode,
+            in String[] targetPackages, in String[] appliedObservers);
+
+    /**
+     * Atomically applies a Blacklist/Whitelist/Global rule to multiple observer apps at once
+     * (HMA-OSS Bulk Config Wizard) in a single rebuild + single disk write.
+     */
+    void setBulkObserverConfig(in String[] observers, int mode,
+            in String[] packages, in String[] templates);
+
+    /** Force-stops a single package (e.g. observer app before re-testing in Laras). */
+    boolean forceStopPackage(String packageName);
 }

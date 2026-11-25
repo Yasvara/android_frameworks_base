@@ -78,6 +78,9 @@ public final class FramefxBroker extends Binder {
     private static final int STATUS = 4;
     private static final int ALIH_OPEN = 5;
     private static final int ALIH_SCAN = 6;
+    // IBinder token, fd -> i32 status: the sound-call ring of a game process whose Lapis section taps
+    // its sound calls (framefx/sounds), kept for Hentak to read.
+    private static final int SOUNDS_ATTACH = 7;
 
     static final int OK = 0;
     static final int NOT_ARMED = -1;
@@ -112,6 +115,7 @@ public final class FramefxBroker extends Binder {
     private static final int LAPIS_SECTION = 3;
     private static final int LAPIS_FLAGS = 2;
     private static final int LAPIS_TEXT_TAP = 1 << 1;
+    private static final int LAPIS_SOUND_TAP = 1 << 3;
     private static final byte[] LAPIS_DEFAULT = {1, 1, 0, 0};
 
     // Lepas: lepasd finds an armed game's fps cap from outside it and holds it at the target. The
@@ -137,6 +141,10 @@ public final class FramefxBroker extends Binder {
     // One per binding: a dead binding's late callbacks must not touch the next one.
     @Nullable private ServiceConnection mAlihConnection;
     private boolean mAlihScanning;
+    // Under mLock.
+    private final ArrayList<SoundsSession> mSoundsSessions = new ArrayList<>();
+
+    private static volatile FramefxBroker sInstance;
 
     private static native boolean nativePublish(ByteBuffer channel, byte[] image);
     private static native boolean nativeSnapshot(ByteBuffer page, byte[] out);
@@ -159,6 +167,48 @@ public final class FramefxBroker extends Binder {
             SharedMemory.unmap(map);
             memory.close();
         }
+    }
+
+    /** A game process's sound-call ring, until the process goes. */
+    private final class SoundsSession implements IBinder.DeathRecipient {
+        final int pid;
+        final int uid;
+        final ParcelFileDescriptor ring;
+
+        SoundsSession(int pid, int uid, ParcelFileDescriptor ring) {
+            this.pid = pid;
+            this.uid = uid;
+            this.ring = ring;
+        }
+
+        @Override
+        public void binderDied() {
+            synchronized (mLock) {
+                mSoundsSessions.remove(this);
+            }
+            try {
+                ring.close();
+            } catch (IOException e) {
+                // Gone either way.
+            }
+        }
+    }
+
+    /** The newest live game process of a uid that taps its sound calls, and its ring. */
+    public static final class SoundsRing {
+        public final int pid;
+        public final FileDescriptor fd;
+
+        SoundsRing(int pid, FileDescriptor fd) {
+            this.pid = pid;
+            this.fd = fd;
+        }
+    }
+
+    /** The broker system_server started, for its other services. */
+    @Nullable
+    public static FramefxBroker get() {
+        return sInstance;
     }
 
     /** A game process's memory with Alih, until the process goes. */
@@ -245,12 +295,13 @@ public final class FramefxBroker extends Binder {
                 }
             }
         }, UserHandle.ALL, filter, null, mHandler);
+        sInstance = this;
     }
 
     @Override
     protected boolean onTransact(int code, @NonNull Parcel data, @Nullable Parcel reply,
             int flags) throws RemoteException {
-        if (code < OPEN || code > ALIH_SCAN) return super.onTransact(code, data, reply, flags);
+        if (code < OPEN || code > SOUNDS_ATTACH) return super.onTransact(code, data, reply, flags);
         data.enforceInterface(DESCRIPTOR);
         if (reply == null) return true;
         final int uid = Binder.getCallingUid();
@@ -260,6 +311,11 @@ public final class FramefxBroker extends Binder {
         }
         if (code == ALIH_OPEN) {
             alihOpen(uid, Binder.getCallingPid(), data.readStrongBinder(), reply);
+            return true;
+        }
+        if (code == SOUNDS_ATTACH) {
+            soundsAttach(uid, Binder.getCallingPid(), data.readStrongBinder(),
+                    data.readFileDescriptor(), reply);
             return true;
         }
         if (code == ALIH_SCAN) {
@@ -314,11 +370,19 @@ public final class FramefxBroker extends Binder {
         } else if (args.length >= 3 && "alih".equals(args[0])) {
             final long token = Binder.clearCallingIdentity();
             try {
-                code = setTextTap(args[1], "on".equals(args[2]));
+                code = setLapisFlag(args[1], LAPIS_TEXT_TAP, "on".equals(args[2]));
             } finally {
                 Binder.restoreCallingIdentity(token);
             }
             pw.println(code == OK ? "ok" : "failed " + code);
+        } else if (args.length >= 3 && "sounds".equals(args[0])) {
+            final long token = Binder.clearCallingIdentity();
+            try {
+                code = setLapisFlag(args[1], LAPIS_SOUND_TAP, "on".equals(args[2]));
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+            pw.println(code == OK ? "ok, takes effect at the game's next start" : "failed " + code);
         } else if (args.length >= 3 && "lepas".equals(args[0])) {
             if ("status".equals(args[2])) {
                 pw.print(lepasState(args[1]));
@@ -357,6 +421,7 @@ public final class FramefxBroker extends Binder {
             pw.println("       video-kelir <package> <section hex>|off");
             pw.println("       video <package> <section hex>|off");
             pw.println("       alih <package> on|off");
+            pw.println("       sounds <package> on|off");
             pw.println("       lepas <package> <fps>|off|status");
         }
         result.send(code == OK ? 0 : -1, null);
@@ -472,15 +537,103 @@ public final class FramefxBroker extends Binder {
         }
     }
 
-    /** The Lapis section's text bit, its other fields kept; takes effect at the game's next start. */
-    private int setTextTap(String pkg, boolean on) {
+    /** One Lapis flag, its other fields kept; takes effect at the game's next start. */
+    private int setLapisFlag(String pkg, int flag, boolean on) {
         final byte[] current = getSection(pkg, LAPIS_SECTION);
         final byte[] next = current != null && current.length == LAPIS_DEFAULT.length
                 ? current.clone() : LAPIS_DEFAULT.clone();
-        next[LAPIS_FLAGS] = (byte) (on ? next[LAPIS_FLAGS] | LAPIS_TEXT_TAP
-                : next[LAPIS_FLAGS] & ~LAPIS_TEXT_TAP);
+        next[LAPIS_FLAGS] = (byte) (on ? next[LAPIS_FLAGS] | flag : next[LAPIS_FLAGS] & ~flag);
         return setSection(pkg, LAPIS_SECTION,
                 java.util.Arrays.equals(next, LAPIS_DEFAULT) ? new byte[0] : next);
+    }
+
+    /** Whether a package of this uid has its Lapis section tap its sound calls. */
+    private boolean tapsSounds(int uid) {
+        final String[] packages = mContext.getPackageManager().getPackagesForUid(uid);
+        if (packages == null) return false;
+        synchronized (mLock) {
+            for (String pkg : packages) {
+                final Channel channel = mChannels.get(pkg);
+                final byte[] lapis = channel != null ? channel.sections.get(LAPIS_SECTION) : null;
+                if (lapis != null && lapis.length > LAPIS_FLAGS
+                        && (lapis[LAPIS_FLAGS] & LAPIS_SOUND_TAP) != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** A game process that taps its sound calls hands over the ring Hentak reads. */
+    private void soundsAttach(int uid, int pid, @Nullable IBinder token,
+            @Nullable ParcelFileDescriptor ring, Parcel reply) {
+        final long id = Binder.clearCallingIdentity();
+        try {
+            if (token == null || ring == null || !tapsSounds(uid)) {
+                reply.writeInt(token == null || ring == null ? BAD_ARGUMENT : NOT_ARMED);
+                closeQuietly(ring);
+                return;
+            }
+        } finally {
+            Binder.restoreCallingIdentity(id);
+        }
+        final SoundsSession session = new SoundsSession(pid, uid, ring);
+        try {
+            token.linkToDeath(session, 0);
+        } catch (RemoteException e) {
+            closeQuietly(ring);
+            reply.writeInt(NOT_ARMED);
+            return;
+        }
+        synchronized (mLock) {
+            mSoundsSessions.add(session);
+        }
+        reply.writeInt(OK);
+        Slog.i(TAG, "sounds attached by uid " + uid + " pid " + pid);
+    }
+
+    private static void closeQuietly(@Nullable ParcelFileDescriptor fd) {
+        if (fd == null) return;
+        try {
+            fd.close();
+        } catch (IOException e) {
+            // Nothing to do.
+        }
+    }
+
+    /** The ring of the newest live process of `uid` that taps its sound calls, or null. */
+    @Nullable
+    public SoundsRing soundsRing(int uid) {
+        synchronized (mLock) {
+            for (int i = mSoundsSessions.size() - 1; i >= 0; i--) {
+                final SoundsSession s = mSoundsSessions.get(i);
+                if (s.uid == uid) return new SoundsRing(s.pid, s.ring.getFileDescriptor());
+            }
+        }
+        return null;
+    }
+
+    /** Packages whose Lapis section taps their sound calls. */
+    public java.util.Set<String> soundTapped() {
+        final java.util.Set<String> out = new java.util.HashSet<>();
+        synchronized (mLock) {
+            for (int i = 0; i < mChannels.size(); i++) {
+                final byte[] lapis = mChannels.valueAt(i).sections.get(LAPIS_SECTION);
+                if (lapis != null && lapis.length > LAPIS_FLAGS
+                        && (lapis[LAPIS_FLAGS] & LAPIS_SOUND_TAP) != 0) {
+                    out.add(mChannels.keyAt(i));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Taps a package's sound calls or stops it, the rest of its Lapis section kept. */
+    public void setSoundTap(String pkg, boolean on) {
+        final byte[] current = getSection(pkg, LAPIS_SECTION);
+        final boolean tapped = current != null && current.length > LAPIS_FLAGS
+                && (current[LAPIS_FLAGS] & LAPIS_SOUND_TAP) != 0;
+        if (tapped != on) setLapisFlag(pkg, LAPIS_SOUND_TAP, on);
     }
 
     /** A game process that taps its text asks for the memory it shares with Alih. */

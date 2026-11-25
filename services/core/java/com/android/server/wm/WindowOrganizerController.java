@@ -1070,7 +1070,23 @@ class WindowOrganizerController extends IWindowOrganizerController.Stub
             tr.setMainWindowSizeChangeTransaction(t);
         }
 
-        int effects = applyChanges(tr, c);
+        final boolean hasLayangChange = (c.getChangeMask()
+                & WindowContainerTransaction.Change.CHANGE_LAYANG_STATE) != 0;
+        final android.app.yasvara.LayangTaskState layangState =
+                hasLayangChange ? c.getLayangState() : null;
+        int effects;
+        if (hasLayangChange && layangState != null) {
+            // Yasvara: mark root task as entering Layang before applyChanges so non-resizable
+            // games pass setRootTaskWindowingMode(FREEFORM) without dropping their bounds.
+            LayangCore.beginEnterLocked(tr);
+            try {
+                effects = applyChanges(tr, c);
+            } finally {
+                LayangCore.endEnterLocked();
+            }
+        } else {
+            effects = applyChanges(tr, c);
+        }
         if ((c.getChangeMask() & WindowContainerTransaction.Change.CHANGE_HIDDEN) != 0) {
             if (tr.setForceHidden(FLAG_FORCE_HIDDEN_FOR_TASK_ORG, c.getHidden())) {
                 effects |= TRANSACT_EFFECTS_LIFECYCLE;
@@ -1078,8 +1094,8 @@ class WindowOrganizerController extends IWindowOrganizerController.Stub
         }
 
         // Yasvara: Layang state, after the bounds and windowing mode above.
-        if ((c.getChangeMask() & WindowContainerTransaction.Change.CHANGE_LAYANG_STATE) != 0) {
-            effects |= LayangCore.applyStateLocked(tr, c.getLayangState());
+        if (hasLayangChange) {
+            effects |= LayangCore.applyStateLocked(tr, layangState);
         }
         LayangCore.onTaskChangedLocked(tr);
 

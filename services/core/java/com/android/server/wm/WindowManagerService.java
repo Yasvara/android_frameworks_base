@@ -787,6 +787,12 @@ public class WindowManagerService extends IWindowManager.Stub
 
     /** Amount of time (in milliseconds) to delay the pointer down outside focus handling */
     private static final int POINTER_DOWN_OUTSIDE_FOCUS_TIMEOUT_MS = 50;
+    /**
+     * Yasvara Layang: grace window when a Layang floating window is focused and a pointer lands
+     * outside it (e.g. phone edge back gesture over a fullscreen background app), so edge back
+     * clears the pending focus steal before the background app can take focus.
+     */
+    private static final int LAYANG_OUTSIDE_FOCUS_TIMEOUT_MS = 160;
 
     /** A runnable to handle pointer down outside focus event. */
     @Nullable
@@ -9869,10 +9875,11 @@ public class WindowManagerService extends IWindowManager.Stub
         clearPointerDownOutsideFocusRunnable();
 
         final InputTarget focusedInputTarget = mFocusedInputTarget;
-        if (shouldDelayTouchOutside(t)) {
+        final int delayMs = getTouchOutsideDelayMs(t);
+        if (delayMs > 0) {
             mPointerDownOutsideFocusRunnable =
                     () -> handlePointerDownOutsideFocus(t, focusedInputTarget);
-            mH.postDelayed(mPointerDownOutsideFocusRunnable, POINTER_DOWN_OUTSIDE_FOCUS_TIMEOUT_MS);
+            mH.postDelayed(mPointerDownOutsideFocusRunnable, delayMs);
         } else if (!fromHandler) {
             // Still post the runnable to handler thread in case there is already a runnable
             // in execution, but still waiting to hold the wm lock.
@@ -9884,7 +9891,7 @@ public class WindowManagerService extends IWindowManager.Stub
         }
     }
 
-    private boolean shouldDelayTouchOutside(InputTarget t) {
+    private int getTouchOutsideDelayMs(InputTarget t) {
         final ActivityRecord activity = t.getActivityRecord();
         final Task task = activity != null ? activity.getTask() : null;
 
@@ -9893,7 +9900,15 @@ public class WindowManagerService extends IWindowManager.Stub
         final boolean isTouchOnFocusedDisplay = mFocusedInputTarget != null
                 && t.getDisplayId() == mFocusedInputTarget.getDisplayId();
         if (!(isInputTargetNotFocused && isTouchOnFocusedDisplay)) {
-            return false;
+            return 0;
+        }
+
+        // Yasvara Layang: when a Layang floating window holds focus over a fullscreen app, an edge
+        // back swipe lands on the fullscreen app underneath first. Delay the focus steal long
+        // enough for BackNavigationController.startBackNavigation() to cancel it.
+        final ActivityRecord focusedActivity = mFocusedInputTarget.getActivityRecord();
+        if (focusedActivity != null && LayangCore.isLayang(focusedActivity)) {
+            return LAYANG_OUTSIDE_FOCUS_TIMEOUT_MS;
         }
 
         // For embedded activity that is showing side-by-side with another activity, delay
@@ -9908,8 +9923,9 @@ public class WindowManagerService extends IWindowManager.Stub
         final boolean shouldDelayTouchForFreeform =
                 task != null && task.getWindowingMode() == WINDOWING_MODE_FREEFORM;
 
-        // If non of the above cases are true, handle the touch-outside event directly.
-        return shouldDelayTouchForEmbeddedActivity || shouldDelayTouchForFreeform;
+        // If none of the above cases are true, handle the touch-outside event directly.
+        return (shouldDelayTouchForEmbeddedActivity || shouldDelayTouchForFreeform)
+                ? POINTER_DOWN_OUTSIDE_FOCUS_TIMEOUT_MS : 0;
     }
 
     private void handlePointerDownOutsideFocus(InputTarget t, InputTarget focusedInputTarget) {

@@ -11,10 +11,7 @@ import static android.view.WindowManager.TRANSIT_CLOSE;
 import static android.view.WindowManager.TRANSIT_TO_BACK;
 import static android.view.WindowManager.TRANSIT_TO_FRONT;
 
-import static android.app.WindowConfiguration.ACTIVITY_TYPE_STANDARD;
-
 import static com.android.wm.shell.ShellTaskOrganizer.TASK_LISTENER_TYPE_LAYANG;
-import static com.android.wm.shell.transition.Transitions.TRANSIT_START_RECENTS_TRANSITION;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
@@ -24,16 +21,21 @@ import android.app.yasvara.ILayangShell;
 import android.app.yasvara.Layang;
 import android.app.yasvara.LayangGeometry;
 import android.app.yasvara.LayangTaskState;
+import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
+import android.database.ContentObserver;
 import android.graphics.Rect;
-import android.animation.ValueAnimator;
+import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.os.RemoteException;
+import android.os.SystemClock;
 import android.os.UserHandle;
 import android.provider.Settings;
-import android.window.DisplayAreaInfo;
-import android.window.TransitionInfo;
-import android.os.RemoteException;
+import android.util.ArrayMap;
 import android.util.Log;
 import android.util.SparseArray;
 import android.view.Choreographer;
@@ -44,6 +46,8 @@ import android.view.InsetsState;
 import android.view.SurfaceControl;
 import android.view.WindowInsets;
 import android.view.WindowManagerGlobal;
+import android.window.DisplayAreaInfo;
+import android.window.TransitionInfo;
 import android.window.WindowContainerToken;
 import android.window.WindowContainerTransaction;
 
@@ -75,6 +79,7 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
         DisplayChangeController.OnDisplayChangingListener,
         DisplayImeController.ImePositionProcessor, Transitions.TransitionObserver {
     static final String TAG = "LayangController";
+    private static final long SOURCE_HINT_TTL_MS = 2500L;
 
     private final Context mContext;
     private final ShellTaskOrganizer mTaskOrganizer;
@@ -91,6 +96,9 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
     /** Live windows by task id. Read in teardown, so R8 keeps every owner object (§3). */
     private final SparseArray<LayangWindow> mWindows = new SparseArray<>();
     private final ShellStub mShellStub = new ShellStub();
+    /** Cached icon/source bounds for pop-up open animations, keyed by taskId or package. */
+    private final SparseArray<SourceHint> mTaskSources = new SparseArray<>();
+    private final ArrayMap<String, SourceHint> mPkgSources = new ArrayMap<>();
 
     @Nullable private ILayangManager mService;
     private boolean mInitialized;
@@ -98,14 +106,15 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
     /** Whether the default display's status bar shows; an immersive app hides it. */
     private boolean mStatusBarVisible = true;
 
+    /** Cached Settings.Secure values (kept live by one ContentObserver; zero hot-path IPC). */
+    private float mGhostAlpha = 0.60f;
+    private int mGripDp = Layang.GRIP_DP_DEFAULT;
+    private int mMiniWidthDp = Layang.MINI_WIDTH_DP_DEFAULT;
+
     /** Window lifted above the IME and where it was before (§4.6); not persisted. */
     private int mImeLiftedTask = -1;
     @Nullable private Rect mImeLiftedFrom;
     @Nullable private Rect mImeLiftedTo;
-
-    /** The recents transition while Overview hides the windows (§6.3). */
-    @Nullable private IBinder mRecentsTransition;
-    private boolean mHiddenForRecents;
 
     public LayangController(@NonNull Context context, @NonNull ShellInit shellInit,
             @NonNull ShellTaskOrganizer taskOrganizer, @NonNull Transitions transitions,
@@ -136,6 +145,8 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
 
     private void onInit() {
         mInitialized = true;
+        refreshCachedSettings(false /* applyLive */);
+        registerSettingsObserver();
         mTaskOrganizer.addListenerForType(this, TASK_LISTENER_TYPE_LAYANG);
         mTransitions.addHandler(mTransitionHandler);
         mTransitions.registerObserver(this);
@@ -149,6 +160,170 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
                     }
                 });
         mBgExecutor.execute(this::registerWithService);
+    }
+
+    private void registerSettingsObserver() {
+        final ContentResolver cr = mContext.getContentResolver();
+        final ContentObserver observer = new ContentObserver(new Handler(Looper.getMainLooper())) {
+            @Override
+            public void onChange(boolean selfChange, @Nullable Uri uri) {
+                mMainExecutor.execute(() -> refreshCachedSettings(true /* applyLive */));
+            }
+        };
+        try {
+            cr.registerContentObserver(Settings.Secure.getUriFor(Layang.KEY_GHOST_ALPHA),
+                    false, observer, UserHandle.USER_ALL);
+            cr.registerContentObserver(Settings.Secure.getUriFor(Layang.KEY_GRIP_DP),
+                    false, observer, UserHandle.USER_ALL);
+            cr.registerContentObserver(Settings.Secure.getUriFor(Layang.KEY_MINI_WIDTH_DP),
+                    false, observer, UserHandle.USER_ALL);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "registerSettingsObserver failed", e);
+        }
+    }
+
+    private void refreshCachedSettings(boolean applyLive) {
+        final ContentResolver cr = mContext.getContentResolver();
+        final int ghostPct = Settings.Secure.getIntForUser(cr, Layang.KEY_GHOST_ALPHA, 60,
+                UserHandle.USER_CURRENT);
+        final float nextGhost = Math.max(0.2f, Math.min(Layang.MAX_GHOST_ALPHA, ghostPct / 100f));
+        final int nextGrip = Math.max(Layang.GRIP_DP_MIN, Math.min(Layang.GRIP_DP_MAX,
+                Settings.Secure.getIntForUser(cr, Layang.KEY_GRIP_DP, Layang.GRIP_DP_DEFAULT,
+                        UserHandle.USER_CURRENT)));
+        final int nextMini = Math.max(Layang.MINI_WIDTH_DP_MIN, Math.min(Layang.MINI_WIDTH_DP_MAX,
+                Settings.Secure.getIntForUser(cr, Layang.KEY_MINI_WIDTH_DP,
+                        Layang.MINI_WIDTH_DP_DEFAULT, UserHandle.USER_CURRENT)));
+
+        final boolean ghostChanged = Math.abs(nextGhost - mGhostAlpha) > 0.001f;
+        final boolean gripChanged = nextGrip != mGripDp;
+        final boolean miniChanged = nextMini != mMiniWidthDp;
+        mGhostAlpha = nextGhost;
+        mGripDp = nextGrip;
+        mMiniWidthDp = nextMini;
+
+        if (!applyLive || mWindows.size() == 0) {
+            return;
+        }
+        for (int i = 0; i < mWindows.size(); i++) {
+            final LayangWindow w = mWindows.valueAt(i);
+            if (ghostChanged) {
+                w.onGhostAlphaChanged();
+            }
+            if (gripChanged) {
+                w.onGripSettingChanged();
+            }
+            if (miniChanged) {
+                final LayangTaskState s = w.getState();
+                if (s != null && s.getMode() == LayangTaskState.MODE_MINI) {
+                    final DisplayLayout dl = displayLayout(w.getTaskInfo().displayId);
+                    final Rect mini = new Rect();
+                    computeMiniBounds(w.getBounds(), dl, mMiniWidthDp, mini);
+                    if (!mini.equals(w.getBounds())) {
+                        commitBounds(w, mini, LayangTransitionHandler.KIND_MODE);
+                    }
+                }
+            }
+        }
+    }
+
+    float getGhostAlpha() {
+        return mGhostAlpha;
+    }
+
+    int getGripDp() {
+        return mGripDp;
+    }
+
+    int getMiniWidthDp() {
+        return mMiniWidthDp;
+    }
+
+    /** Compact mini/bubble placement matching YasvaraLayangService without letterboxing. */
+    void computeMiniBounds(@NonNull Rect from, @NonNull DisplayLayout dl, int miniWidthDp,
+            @NonNull Rect out) {
+        final int displayW = dl.width();
+        final int displayH = dl.height();
+        final int dpi = dl.densityDpi();
+        final int topInset = topInset(dl);
+        final int margin = LayangGeometry.dpToPx(Layang.MARGIN_DP, dpi);
+        final int miniW = LayangGeometry.dpToPx(
+                Math.max(Layang.MINI_WIDTH_DP_MIN, Math.min(Layang.MINI_WIDTH_DP_MAX, miniWidthDp)),
+                dpi);
+        final float aspect = from.width() > 0 ? (float) from.height() / from.width() : 1f;
+        int w;
+        int h;
+        if (aspect >= 1f) {
+            w = miniW;
+            h = Math.round(miniW * aspect);
+            final int maxH = Math.round(displayH * 0.28f);
+            if (h > maxH && maxH > 0) {
+                final float shrink = (float) maxH / h;
+                h = maxH;
+                w = Math.max(LayangGeometry.dpToPx(56, dpi), Math.round(w * shrink));
+            }
+        } else {
+            h = miniW;
+            w = Math.round(miniW / aspect);
+            final int maxW = Math.round(displayW * 0.34f);
+            if (w > maxW && maxW > 0) {
+                final float shrink = (float) maxW / w;
+                w = maxW;
+                h = Math.max(LayangGeometry.dpToPx(56, dpi), Math.round(h * shrink));
+            }
+        }
+        final boolean right = from.centerX() >= displayW / 2;
+        final boolean bottom = from.centerY() >= displayH / 2;
+        final int left = right ? displayW - margin - w : margin;
+        final int top = bottom ? displayH - margin - h : Math.max(margin, topInset);
+        out.set(left, top, left + w, top + h);
+        LayangGeometry.clamp(out, displayW, displayH, margin, topInset);
+    }
+
+    private void cacheSourceBounds(int taskId, @Nullable String pkg, @Nullable Rect src) {
+        if (src == null || src.isEmpty()) {
+            return;
+        }
+        final long now = SystemClock.uptimeMillis();
+        final SourceHint hint = new SourceHint(new Rect(src), now);
+        if (taskId >= 0) {
+            mTaskSources.put(taskId, hint);
+        }
+        if (pkg != null && !pkg.isEmpty()) {
+            mPkgSources.put(pkg, hint);
+        }
+        // Prune stale entries so the maps stay tiny.
+        for (int i = mTaskSources.size() - 1; i >= 0; i--) {
+            if (now - mTaskSources.valueAt(i).uptimeMs > SOURCE_HINT_TTL_MS) {
+                mTaskSources.removeAt(i);
+            }
+        }
+        for (int i = mPkgSources.size() - 1; i >= 0; i--) {
+            if (now - mPkgSources.valueAt(i).uptimeMs > SOURCE_HINT_TTL_MS) {
+                mPkgSources.removeAt(i);
+            }
+        }
+    }
+
+    @Nullable
+    Rect consumeSourceBounds(int taskId, @Nullable String pkg) {
+        final long now = SystemClock.uptimeMillis();
+        final SourceHint byTask = mTaskSources.get(taskId);
+        if (byTask != null) {
+            mTaskSources.remove(taskId);
+            if (pkg != null) {
+                mPkgSources.remove(pkg);
+            }
+            if (now - byTask.uptimeMs <= SOURCE_HINT_TTL_MS) {
+                return new Rect(byTask.bounds);
+            }
+        }
+        if (pkg != null) {
+            final SourceHint byPkg = mPkgSources.remove(pkg);
+            if (byPkg != null && now - byPkg.uptimeMs <= SOURCE_HINT_TTL_MS) {
+                return new Rect(byPkg.bounds);
+            }
+        }
+        return null;
     }
 
     private void registerWithService() {
@@ -226,9 +401,13 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
     /**
      * A new rect of the same shape (move, scale, rotate, mini drag): a scaled app keeps its
      * virtual size, so nothing relayouts; a reflow app gets the density for the new size.
-     * Animated commits morph from where the window is drawn; the others are jump cuts.
      */
     void commitBounds(@NonNull LayangWindow w, @NonNull Rect bounds, boolean animate) {
+        commitBounds(w, bounds, animate
+                ? LayangTransitionHandler.KIND_MODE : LayangTransitionHandler.KIND_COMMIT);
+    }
+
+    void commitBounds(@NonNull LayangWindow w, @NonNull Rect bounds, int transitionKind) {
         final LayangTaskState s = w.getState();
         final WindowContainerTransaction wct = new WindowContainerTransaction();
         wct.setBounds(w.getTaskInfo().token, bounds);
@@ -239,8 +418,7 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
                 wct.setLayangState(w.getTaskInfo().token, next);
             }
         }
-        start(TRANSIT_CHANGE, wct, w.getTaskId(), animate
-                ? LayangTransitionHandler.KIND_MODE : LayangTransitionHandler.KIND_COMMIT);
+        start(TRANSIT_CHANGE, wct, w.getTaskId(), transitionKind);
     }
 
     /**
@@ -346,10 +524,27 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
         start(TRANSIT_TO_FRONT, wct, w.getTaskId(), LayangTransitionHandler.KIND_RAISE);
     }
 
-    void enterLayang(int taskId, @NonNull LayangTaskState state, @NonNull Rect bounds) {
-        final RunningTaskInfo info = mTaskOrganizer.getRunningTaskInfo(taskId);
+    void enterLayang(int taskId, @NonNull LayangTaskState state, @NonNull Rect bounds,
+            @Nullable Bundle opts) {
+        final Rect src = opts != null
+                ? opts.getParcelable(Layang.OPT_SOURCE_BOUNDS, Rect.class) : null;
+        final String pkg = opts != null ? opts.getString(Layang.OPT_SOURCE_PKG) : null;
+        if (src != null && !src.isEmpty()) {
+            cacheSourceBounds(taskId, pkg, src);
+        }
+        // Sentinel pre-launch hint from YasvaraLayangService#openAppInternal for cold starts.
+        if (taskId < 0) {
+            return;
+        }
+        RunningTaskInfo info = mTaskOrganizer.getRunningTaskInfo(taskId);
         if (info == null) {
-            Log.w(TAG, "enterLayang: no task " + taskId);
+            final LayangWindow existing = mWindows.get(taskId);
+            if (existing != null) {
+                info = existing.getTaskInfo();
+            }
+        }
+        if (info == null) {
+            Log.w(TAG, "enterLayang: task " + taskId + " not in ShellTaskOrganizer");
             return;
         }
         final WindowContainerTransaction wct = new WindowContainerTransaction();
@@ -377,8 +572,7 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
                 w.rememberFloatingBounds();
             }
             final Rect mini = new Rect();
-            LayangGeometry.mini(w.getBounds(), dl.width(), dl.height(), dl.densityDpi(),
-                    topInset(dl), mini);
+            computeMiniBounds(w.getBounds(), dl, mMiniWidthDp, mini);
             wct.setBounds(token, mini);
         } else if (mode == LayangTaskState.MODE_FLOATING) {
             wct.setBounds(token, w.getRestoreBounds(dl, topInset(dl)));
@@ -447,6 +641,22 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
         final WindowContainerTransaction wct = new WindowContainerTransaction();
         wct.removeTask(w.getTaskInfo().token);
         start(TRANSIT_CLOSE, wct, taskId, LayangTransitionHandler.KIND_CLOSE);
+    }
+
+    /** Closes and reopens an app floating so game GPU render-scale changes take effect. */
+    void relaunchFloating(int taskId, @NonNull String pkg, int userId) {
+        close(taskId);
+        final ILayangManager service = mService;
+        if (service == null) {
+            return;
+        }
+        mBgExecutor.executeDelayed(() -> {
+            try {
+                service.openApp(new ComponentName(pkg, ""), userId, new Bundle());
+            } catch (RemoteException | RuntimeException e) {
+                Log.w(TAG, "relaunchFloating failed for " + pkg, e);
+            }
+        }, 320L);
     }
 
     void closeAll() {
@@ -585,33 +795,55 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
     }
 
     // ---------------------------------------------------------------------------------------
-    // Overview (§6.3): the windows fade out while Recents is open and come back after.
+    // Atomic corner/alpha preservation across all transitions (including Recents / Overview,
+    // where Layang windows stay visible on top so switching background apps never hides them).
     // ---------------------------------------------------------------------------------------
 
     @Override
     public void onTransitionReady(@NonNull IBinder transition, @NonNull TransitionInfo info,
             @NonNull SurfaceControl.Transaction startTransaction,
             @NonNull SurfaceControl.Transaction finishTransaction) {
-        if (info.getType() == TRANSIT_START_RECENTS_TRANSITION && mWindows.size() > 0) {
-            mRecentsTransition = transition;
-            setHiddenForRecents(true);
+        // Stamp crop, corner radius and ghost alpha atomically into finishTransaction (and
+        // stationary startTransaction) so non-Layang handlers and WM core finishTransactions
+        // can never leave a Layang window square-cornered or full-opacity for even 1 frame.
+        for (int i = 0; i < info.getChanges().size(); i++) {
+            final TransitionInfo.Change c = info.getChanges().get(i);
+            final RunningTaskInfo ti = c.getTaskInfo();
+            if (ti == null || ti.layangState == null) {
+                continue;
+            }
+            final SurfaceControl leash = c.getLeash();
+            if (!leash.isValid()) {
+                continue;
+            }
+            final Rect end = c.getEndAbsBounds();
+            if (end.isEmpty()) {
+                continue;
+            }
+            final LayangWindow w = mWindows.get(ti.taskId);
+            final int radius = w != null ? w.getCornerRadius()
+                    : LayangGeometry.dpToPx(LayangWindow.CORNER_RADIUS_DP,
+                            displayLayout(ti.displayId).densityDpi());
+            final float alpha = w != null ? w.restAlpha()
+                    : (ti.layangState.isGhost() ? mGhostAlpha : 1f);
+            finishTransaction.setWindowCrop(leash, end.width(), end.height())
+                    .setCornerRadius(leash, radius)
+                    .setAlpha(leash, alpha);
+            if (c.getMode() == TRANSIT_CHANGE && c.getStartAbsBounds().equals(end)
+                    && !mTransitionHandler.isAnimating(ti.taskId)) {
+                startTransaction.setWindowCrop(leash, end.width(), end.height())
+                        .setCornerRadius(leash, radius);
+            }
         }
     }
 
     @Override
     public void onTransitionMerged(@NonNull IBinder merged, @NonNull IBinder playing) {
-        if (merged == mRecentsTransition) {
-            mRecentsTransition = playing;
-        }
     }
 
     @Override
     public void onTransitionFinished(@NonNull IBinder transition, boolean aborted) {
-        if (transition == mRecentsTransition) {
-            mRecentsTransition = null;
-            setHiddenForRecents(false);
-        }
-        // Whoever animated the transition may have left a square, uncropped leash.
+        // Belt-and-suspenders shape guard after any transition finishes.
         if (mWindows.size() > 0) {
             final SurfaceControl.Transaction t = mTransactionPool.acquire();
             for (int i = 0; i < mWindows.size(); i++) {
@@ -620,52 +852,6 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
             t.apply();
             mTransactionPool.release(t);
         }
-    }
-
-    private void setHiddenForRecents(boolean hidden) {
-        if (mHiddenForRecents == hidden) {
-            return;
-        }
-        mHiddenForRecents = hidden;
-        final ValueAnimator va = ValueAnimator.ofFloat(hidden ? 1f : 0f, hidden ? 0f : 1f);
-        va.setDuration(150);
-        final ArrayList<LayangWindow> windows = new ArrayList<>();
-        for (int i = 0; i < mWindows.size(); i++) {
-            windows.add(mWindows.valueAt(i));
-        }
-        if (!hidden) {
-            final SurfaceControl.Transaction t = mTransactionPool.acquire();
-            for (LayangWindow w : windows) {
-                w.setOverviewVisible(t, true, 0f);
-            }
-            t.apply();
-            mTransactionPool.release(t);
-        }
-        va.addUpdateListener(a -> {
-            final SurfaceControl.Transaction t = mTransactionPool.acquire();
-            for (LayangWindow w : windows) {
-                w.setOverviewAlpha(t, (float) a.getAnimatedValue());
-            }
-            t.apply();
-            mTransactionPool.release(t);
-        });
-        va.addListener(new android.animation.AnimatorListenerAdapter() {
-            @Override
-            public void onAnimationEnd(android.animation.Animator animation) {
-                final SurfaceControl.Transaction t = mTransactionPool.acquire();
-                for (LayangWindow w : windows) {
-                    // Hidden surfaces also stop taking touches meant for Overview.
-                    w.setOverviewVisible(t, !mHiddenForRecents, mHiddenForRecents ? 0f : 1f);
-                }
-                t.apply();
-                mTransactionPool.release(t);
-            }
-        });
-        va.start();
-    }
-
-    boolean isHiddenForRecents() {
-        return mHiddenForRecents;
     }
 
     /** Committed rects of the other visible floating windows, for magnetic snapping. */
@@ -773,7 +959,9 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
 
     public void dump(@NonNull PrintWriter pw, @NonNull String prefix) {
         pw.println(prefix + TAG + " initialized=" + mInitialized + " service="
-                + (mService != null) + " windows=" + mWindows.size());
+                + (mService != null) + " windows=" + mWindows.size()
+                + " ghostAlpha=" + mGhostAlpha + " gripDp=" + mGripDp
+                + " miniWidthDp=" + mMiniWidthDp);
         for (int i = 0; i < mWindows.size(); i++) {
             pw.println(prefix + "  " + mWindows.valueAt(i));
         }
@@ -784,11 +972,22 @@ public class LayangController implements ShellTaskOrganizer.TaskListener,
         return TAG;
     }
 
+    private static final class SourceHint {
+        final Rect bounds;
+        final long uptimeMs;
+
+        SourceHint(Rect bounds, long uptimeMs) {
+            this.bounds = bounds;
+            this.uptimeMs = uptimeMs;
+        }
+    }
+
     /** Requests from YasvaraLayangService, run on the Shell main thread. */
     private final class ShellStub extends ILayangShell.Stub {
         @Override
         public void enterLayang(int taskId, LayangTaskState state, Rect bounds, Bundle opts) {
-            mMainExecutor.execute(() -> LayangController.this.enterLayang(taskId, state, bounds));
+            mMainExecutor.execute(() -> LayangController.this.enterLayang(taskId, state, bounds,
+                    opts));
         }
 
         @Override

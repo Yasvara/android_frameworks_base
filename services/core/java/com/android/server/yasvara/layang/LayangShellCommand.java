@@ -176,7 +176,8 @@ final class LayangShellCommand extends ShellCommand {
             final LayangStore.App a = mService.store().get(userId, pkg);
             pw.println(a == null ? "no rules" : "always=" + a.always + " blocked=" + a.blocked
                     + " reflow=" + a.readable + " aspectLock=" + a.aspectLock
-                    + " size=" + a.size + " game=" + a.game);
+                    + " size=" + a.size + " game=" + a.game
+                    + " fps=" + a.fps + " res=" + (a.resScale > 0f ? a.resScale : 1f));
             return 0;
         }
         final Bundle b = new Bundle();
@@ -205,12 +206,18 @@ final class LayangShellCommand extends ShellCommand {
             case "size":
                 b.putString(Layang.RULE_SIZE, getNextArgRequired().toUpperCase());
                 break;
+            case "fps":
+                b.putInt(Layang.RULE_FPS, Integer.parseInt(getNextArgRequired()));
+                break;
+            case "res":
+                b.putFloat(Layang.RULE_RES_SCALE, Float.parseFloat(getNextArgRequired()));
+                break;
             case "reset":
                 b.putBoolean(Layang.RULE_RESET_GEOMETRY, true);
                 break;
             default:
                 throw new IllegalArgumentException(
-                        "rules <pkg> always|block|reflow|aspect-lock|game|size|reset ...");
+                        "rules <pkg> always|block|reflow|aspect-lock|game|size|fps|res|reset ...");
         }
         mService.setRulesInternal(pkg, userId, b);
         return 0;

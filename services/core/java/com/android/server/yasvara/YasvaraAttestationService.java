@@ -81,6 +81,11 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
 
     /** Staging prefix the native libc hook reads; one source, never hand-edited. */
     private static final String NATIVE_PIF_PREFIX = "persist.sys.yasvara.pif.";
+    /** Explicit master PIF enabled switch read by keystore2 for true pass-through arbitration. */
+    private static final String NATIVE_PIF_ENABLED_PROPERTY = "persist.sys.yasvara.pif.enabled";
+    /** File published by yasvara_rootd listing active `manage.<feature>` claims by Akar modules. */
+    private static final java.io.File AKAR_MANAGED_FEATURES_FILE =
+            new java.io.File("/data/misc/yasvara_root/managed_features");
     /** Master switch mirrored for keystore2; Settings stays the only input. */
     private static final String NATIVE_ENABLED_PROPERTY = "persist.sys.yasvara.trickystore";
     /** Optional global security patch override mirrored for keystore2. */
@@ -193,22 +198,39 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
     }
 
+    private static boolean isExternalPlayIntegrityModuleActive() {
+        try {
+            if (!AKAR_MANAGED_FEATURES_FILE.isFile()) return false;
+            String text = new String(
+                    java.nio.file.Files.readAllBytes(AKAR_MANAGED_FEATURES_FILE.toPath()),
+                    StandardCharsets.UTF_8);
+            for (String token : text.trim().split(",")) {
+                if ("play_integrity".equals(token.trim())) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     private boolean syncPif() {
         try {
             int pifEnabled = Settings.Secure.getInt(
                     mContext.getContentResolver(), PIF_ENABLED_KEY, 0);
-            if (pifEnabled != 1) {
+            if (pifEnabled != 1 || isExternalPlayIntegrityModuleActive()) {
+                SystemProperties.set(NATIVE_PIF_ENABLED_PROPERTY, "0");
                 clearNativePif();
-                Slog.i(TAG, "PIF disabled: native staging cleared");
+                Slog.i(TAG, "PIF disabled or yielded to external module: native staging cleared");
                 return true;
             }
             Map<String, String> pif = YasvaraSpoofEngine.getPifConfig(mContext);
             if (pif == null || pif.isEmpty()) {
+                SystemProperties.set(NATIVE_PIF_ENABLED_PROPERTY, "0");
                 clearNativePif();
                 Slog.w(TAG, "Empty or invalid PIF config; cleared profile staging");
                 return true;
             }
             stageNativePif(pif);
+            SystemProperties.set(NATIVE_PIF_ENABLED_PROPERTY, "1");
             Slog.i(TAG, "PIF synced: native staging updated");
             return true;
         } catch (Throwable t) {

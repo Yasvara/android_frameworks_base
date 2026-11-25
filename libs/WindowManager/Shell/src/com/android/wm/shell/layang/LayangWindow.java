@@ -22,11 +22,9 @@ import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.Region;
-import android.os.UserHandle;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
-import android.provider.Settings;
 import android.view.Choreographer;
 import android.view.Display;
 import android.view.MotionEvent;
@@ -44,8 +42,8 @@ import com.android.wm.shell.common.DisplayLayout;
  *
  * <p>The chrome lives in its own container under the task display area, layered relative to
  * the task leash, so it is a sibling of the task and never scales with it (§3). A gesture
- * changes only the leash and the chrome positions, one transaction per vsync with no binder
- * call; finger-up commits once through the controller.
+ * changes only the leash and the chrome positions, one transaction per vsync with zero
+ * allocations and zero binder calls; finger-up commits once through the controller.
  *
  * <p>Corners scale: the app keeps its layout. Edges reshape: the content keeps its scale and the
  * app lays itself out once for the new shape on finger-up.
@@ -97,6 +95,12 @@ final class LayangWindow {
     /** Where the window is drawn right now (gesture preview or animation). */
     private final Rect mVisual = new Rect();
     private final Rect mTmp = new Rect();
+    /** Pre-allocated scratch buffers for zero-alloc 240 Hz gesture tracking. */
+    private final int[] mWidthLimits = new int[2];
+    private final float[] mScaleDetents = new float[SCALE_DETENTS.length];
+    private final float[] mRatioDetents = new float[4];
+    private final Region mInputRegion = new Region();
+
     /** Floating bounds to come back to from mini or parked. */
     @Nullable private Rect mRestoreBounds;
     /** Bounds before a double-tap made the window as large as it goes. */
@@ -114,6 +118,8 @@ final class LayangWindow {
     @Nullable private SurfaceControl mVeil;
     @Nullable private SurfaceControl mHandleH;
     @Nullable private SurfaceControl mHandleV;
+    /** Live preview overlay showing the mini/bubble footprint while adjusting size in menu. */
+    @Nullable private SurfaceControl mMiniPreview;
 
     private final int mPillW;
     private final int mPillH;
@@ -132,6 +138,8 @@ final class LayangWindow {
     private int mGrip;
     private int mGripInside;
     private int mGripDp = -1;
+    /** Live ghost opacity preview from Quick Tuning slider, or negative when inactive. */
+    private float mGhostAlphaPreview = -1f;
 
     private int mGesture = G_NONE;
     private int mCorner;
@@ -267,10 +275,14 @@ final class LayangWindow {
             return;
         }
         mDestroyed = true;
+        if (mFramePending) {
+            mController.getChoreographer().removeFrameCallback(mFrameCallback);
+            mFramePending = false;
+        }
         endGesture();
         cancelPendingMenu();
         if (mMenu != null) {
-            mMenu.dismiss();
+            mMenu.dismissImmediate();
             mMenu = null;
         }
         final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
@@ -281,17 +293,47 @@ final class LayangWindow {
         if (mPillHost != null) {
             mPillHost.release();
             mPillHost = null;
+            mPillSurface = null;
+        }
+        if (mMiniPreview != null) {
+            if (mMiniPreview.isValid()) {
+                t.remove(mMiniPreview);
+                mMiniPreview.release();
+            }
+            mMiniPreview = null;
+        }
+        if (mHandleH != null) {
+            if (mHandleH.isValid()) {
+                t.remove(mHandleH);
+                mHandleH.release();
+            }
+            mHandleH = null;
+        }
+        if (mHandleV != null) {
+            if (mHandleV.isValid()) {
+                t.remove(mHandleV);
+                mHandleV.release();
+            }
+            mHandleV = null;
         }
         if (mDecor != null) {
-            t.remove(mDecor);
+            if (mDecor.isValid()) {
+                t.remove(mDecor);
+                mDecor.release();
+            }
             mDecor = null;
         }
         if (mVeil != null) {
-            t.remove(mVeil);
+            if (mVeil.isValid()) {
+                t.remove(mVeil);
+                mVeil.release();
+            }
             mVeil = null;
         }
         // The task left Layang (or closed): drop the rounded shape we put on its leash.
-        t.setCornerRadius(mLeash, 0);
+        if (mLeash.isValid()) {
+            t.setCornerRadius(mLeash, 0);
+        }
         t.apply();
         mController.getTransactionPool().release(t);
     }
@@ -317,16 +359,19 @@ final class LayangWindow {
 
     /** WM core has the new bounds: reset the shape and move the chrome (in t, if given). */
     void onBoundsCommitted(@NonNull Rect bounds, @Nullable SurfaceControl.Transaction t) {
+        if (mDestroyed) {
+            return;
+        }
         mBounds.set(bounds);
         mVisual.set(bounds);
         final SurfaceControl.Transaction tx = t != null ? t
                 : mController.getTransactionPool().acquire();
         applyLeashShape(tx, bounds);
         layoutDecor(tx, bounds);
-        if (mVeil != null) {
+        if (mVeil != null && mVeil.isValid()) {
             tx.hide(mVeil);
         }
-        if (!mController.isHiddenForRecents()) {
+        if (mLeash.isValid()) {
             tx.setAlpha(mLeash, restAlpha());
         }
         if (t == null) {
@@ -337,62 +382,139 @@ final class LayangWindow {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Chrome
+    // Chrome & live previews
     // ---------------------------------------------------------------------------------------
 
     /** Restores the resting shape unless a gesture or animation is drawing the window. */
     void reapplyShape(@NonNull SurfaceControl.Transaction t) {
-        if (mDestroyed || mGesture != G_NONE
+        if (mDestroyed || !mLeash.isValid() || mGesture != G_NONE
                 || mController.getTransitionHandlerAnimating(getTaskId())) {
             return;
         }
         applyLeashShape(t, mBounds);
+        if (!isParked()) {
+            t.setAlpha(mLeash, restAlpha());
+        }
     }
 
     /** Rounded corners (D16) and the crop that makes them, on the task leash. */
     void applyLeashShape(@NonNull SurfaceControl.Transaction t, @NonNull Rect bounds) {
+        if (!mLeash.isValid()) {
+            return;
+        }
         t.setWindowCrop(mLeash, bounds.width(), bounds.height());
         t.setCornerRadius(mLeash, mCornerRadius);
     }
 
     /**
-     * Opacity at rest: a ghost window is see-through at Settings.Secure
-     * yasvara_layang_ghost_alpha (20..80 %), never above the untrusted-touch limit (F12).
+     * Opacity at rest: a ghost window is see-through at the cached ghost alpha (20..80 %),
+     * never above the untrusted-touch limit (F12). Zero IPC.
      */
     float restAlpha() {
+        if (mGhostAlphaPreview >= 0f) {
+            return mGhostAlphaPreview;
+        }
         final LayangTaskState s = mTaskInfo.layangState;
         if (s == null || !s.isGhost()) {
             return 1f;
         }
-        final int pct = Settings.Secure.getIntForUser(mContext.getContentResolver(),
-                Layang.KEY_GHOST_ALPHA, 60, UserHandle.USER_CURRENT);
-        return Math.max(0.2f, Math.min(Layang.MAX_GHOST_ALPHA, pct / 100f));
+        return mController.getGhostAlpha();
     }
 
-    /** Overview fade (§6.3): a is 0..1 on top of the rest alpha. */
-    void setOverviewAlpha(@NonNull SurfaceControl.Transaction t, float a) {
-        if (isParked()) {
+    /** Live ghost opacity change from ContentObserver. */
+    void onGhostAlphaChanged() {
+        if (mDestroyed || !mLeash.isValid() || isParked()) {
             return;
         }
-        t.setAlpha(mLeash, a * restAlpha());
-        if (mDecor != null) {
-            t.setAlpha(mDecor, a);
+        final LayangTaskState s = mTaskInfo.layangState;
+        if (s != null && s.isGhost() && mGhostAlphaPreview < 0f) {
+            final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
+            t.setAlpha(mLeash, restAlpha());
+            t.apply();
+            mController.getTransactionPool().release(t);
         }
     }
 
-    /** Shows or hides the window around Overview; parked windows stay as WM has them. */
-    void setOverviewVisible(@NonNull SurfaceControl.Transaction t, boolean visible, float a) {
-        if (isParked()) {
+    /** Live grip thickness change from ContentObserver. */
+    void onGripSettingChanged() {
+        if (mDestroyed) {
             return;
         }
-        if (visible) {
-            t.show(mLeash);
-            if (mDecor != null) t.show(mDecor);
-        } else {
-            t.hide(mLeash);
-            if (mDecor != null) t.hide(mDecor);
+        updateInputRegion();
+    }
+
+    /** Live transparency preview while dragging the Ghost Opacity slider in Quick Tuning. */
+    void previewGhostAlpha(float alpha) {
+        if (mDestroyed || !mLeash.isValid()) {
+            return;
         }
-        setOverviewAlpha(t, a);
+        mGhostAlphaPreview = Math.max(0.2f, Math.min(Layang.MAX_GHOST_ALPHA, alpha));
+        final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
+        t.setAlpha(mLeash, mGhostAlphaPreview);
+        t.apply();
+        mController.getTransactionPool().release(t);
+    }
+
+    void clearGhostPreview() {
+        if (mGhostAlphaPreview < 0f) {
+            return;
+        }
+        mGhostAlphaPreview = -1f;
+        if (mDestroyed || !mLeash.isValid()) {
+            return;
+        }
+        final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
+        t.setAlpha(mLeash, restAlpha());
+        t.apply();
+        mController.getTransactionPool().release(t);
+    }
+
+    /** Shows a live corner footprint overlay representing the mini/bubble size for widthDp. */
+    void showMiniSizePreview(int widthDp) {
+        if (mDestroyed) {
+            return;
+        }
+        final DisplayLayout dl = mController.displayLayout(mTaskInfo.displayId);
+        mController.computeMiniBounds(mBounds, dl, widthDp, mTmp);
+        final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
+        if (mMiniPreview == null || !mMiniPreview.isValid()) {
+            final SurfaceControl.Builder b = new SurfaceControl.Builder()
+                    .setName("Layang mini preview #" + mTaskInfo.taskId)
+                    .setColorLayer()
+                    .setCallsite("LayangWindow.miniPreview");
+            mController.getRootTdaOrganizer().attachToDisplayArea(mTaskInfo.displayId, b);
+            mMiniPreview = b.build();
+            t.setColor(mMiniPreview, rgb(mContext.getColor(android.R.color.system_accent1_300)))
+                    .setCornerRadius(mMiniPreview, mCornerRadius)
+                    .setLayer(mMiniPreview, Integer.MAX_VALUE - 2)
+                    .setAlpha(mMiniPreview, 0.38f);
+        }
+        t.setPosition(mMiniPreview, mTmp.left, mTmp.top)
+                .setWindowCrop(mMiniPreview, mTmp.width(), mTmp.height())
+                .show(mMiniPreview)
+                .apply();
+        mController.getTransactionPool().release(t);
+    }
+
+    void hideMiniSizePreview() {
+        if (mMiniPreview == null) {
+            return;
+        }
+        final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
+        if (mMiniPreview.isValid()) {
+            t.remove(mMiniPreview);
+            mMiniPreview.release();
+        }
+        mMiniPreview = null;
+        t.apply();
+        mController.getTransactionPool().release(t);
+    }
+
+    void setPillAlpha(@NonNull SurfaceControl.Transaction t, float alpha) {
+        if (mDestroyed || mPillSurface == null || !mPillSurface.isValid()) {
+            return;
+        }
+        t.setAlpha(mPillSurface, Math.max(0f, Math.min(1f, alpha)));
     }
 
     private boolean isParked() {
@@ -402,22 +524,25 @@ final class LayangWindow {
 
     /** Positions the pill, the frame input and the handle lines for a window drawn at v. */
     void layoutDecor(@NonNull SurfaceControl.Transaction t, @NonNull Rect v) {
-        if (mDecor == null || mPillSurface == null || mFrameInput == null) {
+        if (mDestroyed || mDecor == null || !mDecor.isValid()
+                || mPillSurface == null || !mPillSurface.isValid() || mFrameInput == null) {
             return;
         }
         final float barCenterY = v.top - mPillGap - mBarH / 2f;
         t.setPosition(mPillSurface, v.centerX() - mPillW / 2f, barCenterY - mPillH / 2f);
-        t.setPosition(mFrameInput.getSurface(), v.left - mGrip, v.top - mGrip);
-        // A container layer has no bounds of its own: without a crop input sees an empty frame
-        // and drops the touch region, so the handles and the mini shield would get nothing.
-        t.setWindowCrop(mFrameInput.getSurface(), v.width() + 2 * mGrip,
-                v.height() + 2 * mGrip);
+        final SurfaceControl frameSc = mFrameInput.getSurface();
+        if (frameSc.isValid()) {
+            t.setPosition(frameSc, v.left - mGrip, v.top - mGrip);
+            // A container layer has no bounds of its own: without a crop input sees an empty
+            // frame and drops the touch region.
+            t.setWindowCrop(frameSc, v.width() + 2 * mGrip, v.height() + 2 * mGrip);
+        }
         layoutHandles(t, v);
     }
 
     /** The accent line on the grabbed corner (an L) or edge, only while it is held. */
     private void layoutHandles(@NonNull SurfaceControl.Transaction t, @NonNull Rect v) {
-        if (mHandleH == null || mHandleV == null) {
+        if (mHandleH == null || mHandleV == null || !mHandleH.isValid() || !mHandleV.isValid()) {
             return;
         }
         final int th = mHandle;
@@ -454,7 +579,8 @@ final class LayangWindow {
     /** Visibility of the chrome and the touch region for the current mode and flags. */
     private void updateChromeState() {
         final LayangTaskState s = mTaskInfo.layangState;
-        if (s == null || mDecor == null || mPillSurface == null) {
+        if (mDestroyed || s == null || mDecor == null || !mDecor.isValid()
+                || mPillSurface == null || !mPillSurface.isValid()) {
             return;
         }
         final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
@@ -470,7 +596,7 @@ final class LayangWindow {
         } else {
             t.show(mPillSurface);
         }
-        if (!parked && !mController.isHiddenForRecents()) {
+        if (!parked && mLeash.isValid()) {
             t.setAlpha(mLeash, restAlpha());
         }
         t.apply();
@@ -481,11 +607,9 @@ final class LayangWindow {
         updateInputRegion();
     }
 
-    /** Reads the handle thickness; true when it changed. */
+    /** Reads the cached handle thickness; true when it changed. Zero IPC. */
     private boolean refreshGrip(int dpi) {
-        final int dp = Math.max(Layang.GRIP_DP_MIN, Math.min(Layang.GRIP_DP_MAX,
-                Settings.Secure.getIntForUser(mContext.getContentResolver(), Layang.KEY_GRIP_DP,
-                        Layang.GRIP_DP_DEFAULT, UserHandle.USER_CURRENT)));
+        final int dp = mController.getGripDp();
         if (dp == mGripDp) {
             return false;
         }
@@ -512,7 +636,7 @@ final class LayangWindow {
      * edge bands while floating; a full shield while mini (§4.5). The top edge stays the pill's.
      */
     private void updateInputRegion() {
-        if (mFrameInput == null) {
+        if (mDestroyed || mFrameInput == null) {
             return;
         }
         if (refreshGrip(mController.displayLayout(mTaskInfo.displayId).densityDpi())
@@ -523,7 +647,8 @@ final class LayangWindow {
             mController.getTransactionPool().release(t);
         }
         final LayangTaskState s = mTaskInfo.layangState;
-        final Region r = new Region();
+        final Region r = mInputRegion;
+        r.setEmpty();
         final int w = mBounds.width();
         final int h = mBounds.height();
         final int g = mGrip;
@@ -553,7 +678,7 @@ final class LayangWindow {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Gestures
+    // Gestures (zero-alloc hot path at 240 Hz)
     // ---------------------------------------------------------------------------------------
 
     private void onPillTouch(@NonNull MotionEvent e) {
@@ -733,24 +858,28 @@ final class LayangWindow {
         }
     }
 
+    /** Zero-allocation velocity tracking in raw display coordinates. */
     private void track(@NonNull MotionEvent e) {
         mLastX = e.getRawX();
         mLastY = e.getRawY();
         if (mVelocity != null) {
-            final MotionEvent copy = MotionEvent.obtain(e);
-            copy.setLocation(e.getRawX(), e.getRawY());
-            mVelocity.addMovement(copy);
-            copy.recycle();
+            final float ox = mLastX - e.getX();
+            final float oy = mLastY - e.getY();
+            e.offsetLocation(ox, oy);
+            mVelocity.addMovement(e);
+            e.offsetLocation(-ox, -oy);
         }
     }
 
     private boolean passedSlop(@NonNull MotionEvent e) {
-        return Math.hypot(e.getRawX() - mDownX, e.getRawY() - mDownY) > mTouchSlop;
+        final float dx = e.getRawX() - mDownX;
+        final float dy = e.getRawY() - mDownY;
+        return dx * dx + dy * dy > (float) mTouchSlop * mTouchSlop;
     }
 
     /**
      * Uniform scale around the corner opposite to the grabbed one (aspect kept, §4.1), pulled
-     * onto 50, 75 and 100 % of the largest size that fits.
+     * onto 50, 75 and 100 % of the largest size that fits. Zero-alloc.
      */
     private void previewScale(float dx, float dy) {
         final DisplayLayout dl = mController.displayLayout(mTaskInfo.displayId);
@@ -763,13 +892,12 @@ final class LayangWindow {
         final float byX = w0 + sx * dx;
         final float byY = (h0 + sy * dy) / aspect;
         float w = Math.abs(sx * dx) >= Math.abs(sy * dy / aspect) ? byX : byY;
-        final int[] limits = widthLimits(dl);
-        w = Math.max(limits[0], Math.min(limits[1], w));
-        final float[] detents = new float[SCALE_DETENTS.length];
-        for (int i = 0; i < detents.length; i++) {
-            detents[i] = SCALE_DETENTS[i] * limits[1];
+        computeWidthLimits(dl, mWidthLimits);
+        w = Math.max(mWidthLimits[0], Math.min(mWidthLimits[1], w));
+        for (int i = 0; i < SCALE_DETENTS.length; i++) {
+            mScaleDetents[i] = SCALE_DETENTS[i] * mWidthLimits[1];
         }
-        w = pullToDetent(w, detents, DETENT_PULL * limits[1]);
+        w = pullToDetent(w, mScaleDetents, DETENT_PULL * mWidthLimits[1]);
         final int nw = Math.round(w);
         final int nh = Math.round(w * aspect);
         final int ax = sx > 0 ? mBounds.left : mBounds.right;
@@ -782,7 +910,7 @@ final class LayangWindow {
     /**
      * Moves one edge. The content keeps its scale, so the app's virtual screen grows or
      * shrinks with the window; it never gets narrower than a phone layout (320 dp). Pulled
-     * onto 9:20, 3:4, 1:1 and 16:9. An app with a fixed orientation keeps it.
+     * onto 9:20, 3:4, 1:1 and 16:9. An app with a fixed orientation keeps it. Zero-alloc.
      */
     private void previewEdge(float dx, float dy) {
         final DisplayLayout dl = mController.displayLayout(mTaskInfo.displayId);
@@ -810,9 +938,12 @@ final class LayangWindow {
         } else if (fixed == Configuration.ORIENTATION_LANDSCAPE && ratio < 1f) {
             ratio = 1f;
         }
-        final float[] detents = {(float) Math.min(dl.width(), dl.height())
-                / Math.max(dl.width(), dl.height()), 0.75f, 1f, 16f / 9f};
-        ratio = pullToDetent(ratio, detents, DETENT_PULL * ratio);
+        mRatioDetents[0] = (float) Math.min(dl.width(), dl.height())
+                / Math.max(1, Math.max(dl.width(), dl.height()));
+        mRatioDetents[1] = 0.75f;
+        mRatioDetents[2] = 1f;
+        mRatioDetents[3] = 16f / 9f;
+        ratio = pullToDetent(ratio, mRatioDetents, DETENT_PULL * ratio);
         if (Math.abs(ratio - (float) v.width() / Math.max(1, v.height())) > 0.001f) {
             switch (mEdge) {
                 case EDGE_LEFT:
@@ -877,7 +1008,7 @@ final class LayangWindow {
         return hit >= 0 ? targets[hit] : value;
     }
 
-    private void tick() {
+    void tick() {
         if (mVibrator != null) {
             mVibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK),
                     VibrationAttributes.createForUsage(VibrationAttributes.USAGE_TOUCH));
@@ -888,15 +1019,16 @@ final class LayangWindow {
         return Math.max(lo, Math.min(Math.max(lo, hi), v));
     }
 
-    /** {min, max} width of the window while scaling; no floor beyond a grabbable size. */
-    private int[] widthLimits(@NonNull DisplayLayout dl) {
+    /** Writes {min, max} width of the window while scaling into out[0..1]. */
+    private void computeWidthLimits(@NonNull DisplayLayout dl, @NonNull int[] out) {
         final int margin = LayangGeometry.dpToPx(Layang.MARGIN_DP, dl.densityDpi());
         final int min = LayangGeometry.dpToPx(MIN_WIDTH_DP, dl.densityDpi());
         final float aspect = (float) mBounds.height() / Math.max(1, mBounds.width());
         final int maxByW = dl.width() - 2 * margin;
         final int maxByH = Math.round((dl.height() - margin - mController.topInset(dl))
                 / aspect);
-        return new int[] {min, Math.max(min, Math.min(maxByW, maxByH))};
+        out[0] = min;
+        out[1] = Math.max(min, Math.min(maxByW, maxByH));
     }
 
     private void finishMove(@NonNull MotionEvent e) {
@@ -916,7 +1048,7 @@ final class LayangWindow {
 
     /**
      * A mini window sticks to the nearer side, or to the side it is flung towards, at the
-     * height it was let go; it is never parked by a drag (HyperOS-like).
+     * height it was let go; settles with a subtle HyperOS 4 bounce spring.
      */
     private void finishShieldMove() {
         final DisplayLayout dl = mController.displayLayout(mTaskInfo.displayId);
@@ -932,7 +1064,7 @@ final class LayangWindow {
                 Math.round(target.top + vy * MINI_THROW_S));
         LayangGeometry.clamp(target, dl.width(), dl.height(), margin,
                 mController.topInset(dl));
-        mController.commitBounds(this, target, true /* animate */);
+        mController.commitBounds(this, target, LayangTransitionHandler.KIND_SNAP);
     }
 
     private void finishScale() {
@@ -974,13 +1106,15 @@ final class LayangWindow {
         if (!settle) {
             applyFrame();
         }
-        mController.commitBounds(this, target, settle);
+        mController.commitBounds(this, target,
+                settle ? LayangTransitionHandler.KIND_SNAP : LayangTransitionHandler.KIND_COMMIT);
     }
 
     /** Double-tap on the pill: as large as it fits, and back to the size before. */
     private void toggleSize() {
         final DisplayLayout dl = mController.displayLayout(mTaskInfo.displayId);
-        final int max = widthLimits(dl)[1];
+        computeWidthLimits(dl, mWidthLimits);
+        final int max = mWidthLimits[1];
         final boolean atMax = mBounds.width() >= max - mTouchSlop;
         final Rect target;
         if (atMax && mPreToggleBounds != null) {
@@ -991,7 +1125,7 @@ final class LayangWindow {
                 mPreToggleBounds = new Rect(mBounds);
             }
             final int w = Math.round(atMax ? max * SCALE_DETENTS[0] : max);
-            final int h = Math.round(w * (float) mBounds.height() / mBounds.width());
+            final int h = Math.round(w * (float) mBounds.height() / Math.max(1, mBounds.width()));
             target = new Rect(mBounds.centerX() - w / 2, mBounds.centerY() - h / 2,
                     mBounds.centerX() - w / 2 + w, mBounds.centerY() - h / 2 + h);
         }
@@ -1097,7 +1231,7 @@ final class LayangWindow {
     private void restoreShape() {
         final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
         applyLeashShape(t, mBounds);
-        if (mVeil != null) {
+        if (mVeil != null && mVeil.isValid()) {
             t.hide(mVeil);
         }
         t.apply();
@@ -1106,7 +1240,7 @@ final class LayangWindow {
     }
 
     private void scheduleFrame() {
-        if (!mFramePending) {
+        if (!mFramePending && !mDestroyed) {
             mFramePending = true;
             mController.getChoreographer().postFrameCallback(mFrameCallback);
         }
@@ -1115,7 +1249,7 @@ final class LayangWindow {
     /** One transaction per vsync: leash position and scale, chrome position (§4.4). */
     private void applyFrame() {
         mFramePending = false;
-        if (mDestroyed) {
+        if (mDestroyed || !mLeash.isValid()) {
             return;
         }
         final SurfaceControl.Transaction t = mController.getTransactionPool().acquire();
@@ -1126,17 +1260,22 @@ final class LayangWindow {
     }
 
     /**
-     * Draws the window at v relative to its committed bounds: scaled while moving or scaling;
-     * while reshaping, unscaled and cropped to v, with the veil filling what is not drawn yet.
+     * Draws the window at v relative to its committed bounds: scaled with inverse-scaled
+     * corners while moving or scaling; while reshaping, unscaled and cropped to v, with the
+     * veil filling what is not drawn yet.
      */
     void applyVisual(@NonNull SurfaceControl.Transaction t, @NonNull Rect v) {
+        if (mDestroyed || !mLeash.isValid()) {
+            return;
+        }
         if (mGesture == G_EDGE) {
             t.setPosition(mLeash, mBounds.left, mBounds.top);
             t.setScale(mLeash, 1f, 1f);
             mTmp.set(v);
             mTmp.offset(-mBounds.left, -mBounds.top);
             t.setCrop(mLeash, mTmp);
-            if (mVeil != null) {
+            t.setCornerRadius(mLeash, mCornerRadius);
+            if (mVeil != null && mVeil.isValid()) {
                 t.setPosition(mVeil, v.left, v.top).setWindowCrop(mVeil, v.width(), v.height())
                         .show(mVeil);
             }
@@ -1144,6 +1283,7 @@ final class LayangWindow {
             final float scale = (float) v.width() / Math.max(1, mBounds.width());
             t.setPosition(mLeash, v.left, v.top);
             t.setScale(mLeash, scale, scale);
+            t.setCornerRadius(mLeash, mCornerRadius / Math.max(0.15f, scale));
         }
         layoutDecor(t, v);
     }
@@ -1181,10 +1321,10 @@ final class LayangWindow {
             case LayangPillView.A11Y_SMALLER: {
                 final DisplayLayout dl = mController.displayLayout(mTaskInfo.displayId);
                 final float f = action == LayangPillView.A11Y_BIGGER ? 1.15f : 1 / 1.15f;
-                final int[] limits = widthLimits(dl);
-                final int w = Math.max(limits[0], Math.min(limits[1],
+                computeWidthLimits(dl, mWidthLimits);
+                final int w = Math.max(mWidthLimits[0], Math.min(mWidthLimits[1],
                         Math.round(mBounds.width() * f)));
-                final int h = Math.round(w * (float) mBounds.height() / mBounds.width());
+                final int h = Math.round(w * (float) mBounds.height() / Math.max(1, mBounds.width()));
                 mVisual.set(mBounds.centerX() - w / 2, mBounds.centerY() - h / 2,
                         mBounds.centerX() - w / 2 + w, mBounds.centerY() - h / 2 + h);
                 commitVisual(dl);

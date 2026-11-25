@@ -37,4 +37,15 @@
     <string name="layang_menu_ratio">Window shape %1$s</string>
     <string name="layang_reflow_on">This app now re-lays out for its window</string>
     <string name="layang_reflow_off">This app now scales like a phone screen</string>
+
+    <string name="layang_menu_tune">Quick tuning</string>
+    <string name="layang_menu_settings">Layang settings</string>
+    <string name="layang_menu_relaunch">Relaunch app to apply render scale</string>
+    <string name="layang_tune_fps">FPS limit</string>
+    <string name="layang_tune_fps_auto">Auto</string>
+    <string name="layang_tune_res">Resolution</string>
+    <string name="layang_tune_res_native">Native</string>
+    <string name="layang_tune_mini_size">Bubble size</string>
+    <string name="layang_tune_ghost">Ghost opacity</string>
+    <string name="layang_tune_relaunch_hint">Relaunch</string>
 </resources>

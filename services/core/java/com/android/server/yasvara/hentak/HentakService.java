@@ -38,6 +38,7 @@ import android.util.Slog;
 
 import com.android.internal.os.BackgroundThread;
 import com.android.internal.util.DumpUtils;
+import com.android.server.yasvara.framefx.FramefxBroker;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -61,6 +62,10 @@ import java.util.Locale;
  * {@code {"<pkg>": 1|2}} (on, strong; absent is off) and {@code pentas_hentak_sens}
  * {@code {"<pkg>": "0.5".."1.5"}}. Strong raises the HAL's sustain past the motor's knee: harder
  * hits, more coil heat, so Pentas shows a caution and the HAL's coil model still caps it.
+ *
+ * <p>Every game with Hentak on also taps its own sound calls (framefx/sounds, the Lapis section's
+ * sound bit): audioserver asks here for the armed game's ring and settles hits by what the game
+ * started just before them.
  */
 public final class HentakService extends Binder {
 
@@ -70,6 +75,8 @@ public final class HentakService extends Binder {
     // Mirrors frameworks/av/services/hentak.
     private static final String DESCRIPTOR = "org.yasvara.hentak.IHentak";
     private static final int TRANSACTION_PULSE = IBinder.FIRST_CALL_TRANSACTION;
+    /** uid -> i32 pid of the process whose sound-call ring follows, 0 for none; the descriptor. */
+    private static final int TRANSACTION_SOUNDS = IBinder.FIRST_CALL_TRANSACTION + 1;
     private static final int KIND_IMPACT = 0;
     private static final int KIND_BLAST = 1;
     private static final int KIND_RUMBLE = 2;
@@ -235,6 +242,7 @@ public final class HentakService extends Binder {
             mNoMmap = noMmap;
             AudioSystem.setParameters("hentak_nommap=" + noMmap);
         }
+        tapSounds(enabledPackages(user));
         final float gain = gain(user);
         if (uid == mUid && mode == mMode && sens == mSensitivity && gain == mGain) return;
         final boolean newGame = uid >= 0 && uid != mUid;
@@ -253,6 +261,37 @@ public final class HentakService extends Binder {
         }
         setHalDrive(mode == MODE_STRONG ? EffectStrength.STRONG : EffectStrength.LIGHT);
         Slog.i(TAG, mode == MODE_OFF ? "Disarmed" : "Armed " + pkg + " mode " + mode + " sens " + sens);
+    }
+
+    /** Has framefx tap the sound calls of exactly these packages, from their next start. */
+    private void tapSounds(java.util.Set<String> packages) {
+        final FramefxBroker broker = FramefxBroker.get();
+        if (broker == null) return;
+        final java.util.Set<String> tapped = broker.soundTapped();
+        for (String pkg : packages) {
+            if (!tapped.contains(pkg)) broker.setSoundTap(pkg, true);
+        }
+        for (String pkg : tapped) {
+            if (!packages.contains(pkg)) broker.setSoundTap(pkg, false);
+        }
+    }
+
+    /** Every package Pentas has Hentak on for. */
+    private java.util.Set<String> enabledPackages(int user) {
+        final java.util.Set<String> out = new java.util.HashSet<>();
+        final String json = Settings.System.getStringForUser(mContext.getContentResolver(),
+                KEY_MODE, user);
+        if (json == null || json.isEmpty()) return out;
+        try {
+            final JSONObject map = new JSONObject(json);
+            for (java.util.Iterator<String> it = map.keys(); it.hasNext(); ) {
+                final String pkg = it.next();
+                if (map.optInt(pkg, MODE_OFF) != MODE_OFF) out.add(pkg);
+            }
+        } catch (JSONException e) {
+            // enabledUids logs it.
+        }
+        return out;
     }
 
     /** Uids of every package Pentas has Hentak on for, comma separated. */
@@ -332,6 +371,17 @@ public final class HentakService extends Binder {
     @Override
     protected boolean onTransact(int code, @NonNull Parcel data, @Nullable Parcel reply, int flags)
             throws RemoteException {
+        if (code == TRANSACTION_SOUNDS) {
+            if (Binder.getCallingUid() != Process.AUDIOSERVER_UID || reply == null) return false;
+            data.enforceInterface(DESCRIPTOR);
+            final int uid = data.readInt();
+            final FramefxBroker broker = FramefxBroker.get();
+            final FramefxBroker.SoundsRing ring =
+                    broker != null && uid == mUid ? broker.soundsRing(uid) : null;
+            reply.writeInt(ring != null ? ring.pid : 0);
+            if (ring != null) reply.writeFileDescriptor(ring.fd);
+            return true;
+        }
         if (code != TRANSACTION_PULSE) return super.onTransact(code, data, reply, flags);
         if (Binder.getCallingUid() != Process.AUDIOSERVER_UID) return false;
         data.enforceInterface(DESCRIPTOR);

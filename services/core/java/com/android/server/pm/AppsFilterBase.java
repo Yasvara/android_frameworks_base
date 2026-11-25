@@ -343,7 +343,7 @@ public abstract class AppsFilterBase implements AppsFilterSnapshot {
             }
 
             if (Process.isApplicationUid(callingAppId)
-                    && AppVisibilityPolicy.shouldHide(
+                    && android.security.yasvara.YasvaraTabirPolicy.shouldHidePackage(
                             callingAppId, targetAppId, targetPkgSetting.getPackageName())) {
                 return true;
             }

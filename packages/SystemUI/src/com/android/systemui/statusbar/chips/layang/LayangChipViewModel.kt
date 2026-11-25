@@ -9,6 +9,9 @@ import android.app.yasvara.ILayangListener
 import android.app.yasvara.Layang
 import android.app.yasvara.LayangWindowInfo
 import android.content.Context
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
 import android.os.UserHandle
 import android.provider.Settings
 import android.util.Log
@@ -35,7 +38,7 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 
 /**
@@ -86,13 +89,41 @@ constructor(
             }
             .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
+    /** Reactively observes Settings.Secure KEY_CHIP so toggling in Laras updates live. */
+    private val chipEnabled: StateFlow<Boolean> =
+        callbackFlow {
+                val cr = context.contentResolver
+                val observer =
+                    object : ContentObserver(Handler(Looper.getMainLooper())) {
+                        override fun onChange(selfChange: Boolean) {
+                            trySend(readChipEnabled())
+                        }
+                    }
+                trySend(readChipEnabled())
+                try {
+                    cr.registerContentObserver(
+                        Settings.Secure.getUriFor(Layang.KEY_CHIP),
+                        false,
+                        observer,
+                        UserHandle.USER_ALL,
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "registerContentObserver failed", e)
+                }
+                awaitClose {
+                    try {
+                        cr.unregisterContentObserver(observer)
+                    } catch (_: Exception) {}
+                }
+            }
+            .stateIn(scope, SharingStarted.Eagerly, readChipEnabled())
+
     /** Task id of the last window parked because of memory pressure, or -1 (§5.6). */
     @Volatile var autoParked: Int = -1
 
     override val chip: StateFlow<OngoingActivityChipModel> =
-        windows
-            .map { list ->
-                if (list.isEmpty() || !chipEnabled()) {
+        combine(windows, chipEnabled) { list, enabled ->
+                if (list.isEmpty() || !enabled) {
                     OngoingActivityChipModel.Inactive()
                 } else {
                     toChip(list)
@@ -100,7 +131,7 @@ constructor(
             }
             .stateIn(scope, SharingStarted.Lazily, OngoingActivityChipModel.Inactive())
 
-    private fun chipEnabled(): Boolean =
+    private fun readChipEnabled(): Boolean =
         Settings.Secure.getIntForUser(
             context.contentResolver,
             Layang.KEY_CHIP,

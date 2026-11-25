@@ -2077,7 +2077,10 @@ class ActivityStarter {
 
         mTargetTask = targetTask;
 
-        // Yasvara: a Layang launch may float apps that are not resizable.
+        // Yasvara: resolve trampoline inheritance (splash -> real game) and RULE_ALWAYS,
+        // and mark Layang launch pending so non-resizable games pass freeform validation.
+        mOptions = LayangCore.maybeResolveLayangOptionsLocked(r, sourceRecord, mOptions,
+                targetTask);
         r.mLayangLaunchPending = mOptions != null && mOptions.getLayangLaunch() != null;
         computeLaunchParams(r, sourceRecord, targetTask);
 
@@ -2153,6 +2156,12 @@ class ActivityStarter {
                 }
             }
             recordTransientLaunchIfNeeded(targetTaskTop);
+            // Yasvara: if a Layang launch reuses an existing task (e.g. non-resizable game in
+            // Recents), put that task into Layang freeform before recycleTask returns early.
+            if (mOptions != null && mOptions.getLayangLaunch() != null) {
+                LayangCore.applyLaunchToTaskLocked(targetTask, mOptions, mSourceRecord,
+                        mStartActivity);
+            }
             // Recycle the target task for this launch.
             startResult =
                     recycleTask(targetTask, targetTaskTop, reusedTask, intentGrants);
@@ -2190,9 +2199,10 @@ class ActivityStarter {
                     mStartActivity.info.windowLayout, mStartActivity, mSourceRecord, options);
             addOrReparentStartingActivity(targetTask, "adding to task");
         }
-        // Yasvara: the task becomes a Layang window before its first configuration is sent.
-        if (newTask) {
-            LayangCore.onActivityStartedLocked(mStartActivity, mOptions);
+        // Yasvara: the task becomes a Layang window before its first configuration is sent
+        // (covers both fresh tasks and stopped/reused Recents tasks).
+        if (newTask || mAddingToTask) {
+            LayangCore.onActivityStartedLocked(mStartActivity, mOptions, mSourceRecord);
         }
 
         // After activity is attached to task, but before actual start
