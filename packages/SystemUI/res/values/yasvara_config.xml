@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources>
+    <!-- Package of an app that records the screen with its own MediaProjection. Its projection is
+         shown as a screen recording (timer chip, stop dialog), not as sharing to an app.
+         Empty: only SystemUI's recorder counts. -->
+    <string name="config_screenRecorderPackage" translatable="false"></string>
+</resources>

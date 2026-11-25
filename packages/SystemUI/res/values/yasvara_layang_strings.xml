@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<!-- Layang floating windows: status-bar chip and its popup. -->
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+    <string name="layang_chip_description">Floating windows</string>
+    <string name="layang_dialog_title">Floating windows</string>
+    <string name="layang_dialog_empty">No floating windows</string>
+    <string name="layang_dialog_open_app">Open app</string>
+    <string name="layang_dialog_close_all">Close all</string>
+    <string name="layang_dialog_done">Done</string>
+    <string name="layang_state_floating">Floating</string>
+    <string name="layang_state_mini">Mini</string>
+    <string name="layang_state_parked">Parked</string>
+    <string name="layang_state_parked_memory">Parked to free memory</string>
+    <string name="layang_close_window">Close <xliff:g id="app" example="Genshin Impact">%1$s</xliff:g></string>
+    <string name="layang_picker_title">Open as floating window</string>
+    <string name="layang_picker_search">Search apps</string>
+    <string name="layang_notification_open_floating">Open floating</string>
+</resources>

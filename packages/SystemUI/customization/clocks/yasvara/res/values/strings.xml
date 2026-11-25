@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources>
+    <string name="clock_accent_name">Accent</string>
+    <string name="clock_accent_description">Hours stacked over minutes, the hour in an accent colour</string>
+    <string name="clock_thin_name">Thin</string>
+    <string name="clock_thin_description">Large light numerals over the date</string>
+    <string name="clock_analog_name">Analog</string>
+    <string name="clock_analog_description">Hands on a dial shaped by the wallpaper colours</string>
+    <string name="clock_label_name">Label</string>
+    <string name="clock_label_description">Time and date on rounded labels</string>
+    <string name="clock_bubble_name">Bubble</string>
+    <string name="clock_bubble_description">Each digit in its own bubble</string>
+    <string name="clock_code_name">Code</string>
+    <string name="clock_code_description">The time written as a line of code</string>
+    <string name="clock_orbit_name">Orbit</string>
+    <string name="clock_orbit_description">The time beside a ring of the date</string>
+    <string name="clock_words_name">Kata</string>
+    <string name="clock_words_description">The time as a sentence, in your language</string>
+    <string name="clock_flex_name">Laras Flex</string>
+    <string name="clock_flex_description">A variable font clock with adjustable weight, width and roundness</string>
+    <string name="clock_shape_name">Shape</string>
+    <string name="clock_shape_description">Digits in expressive shapes that change every minute</string>
+    <string name="clock_wave_name">Gelombang</string>
+    <string name="clock_wave_description">Digits riding a slow wave</string>
+    <string name="clock_stack_name">Tumpuk</string>
+    <string name="clock_stack_description">An oversized hour behind the minutes, made for depth wallpapers</string>
+    <string name="clock_dots_name">Titik</string>
+    <string name="clock_dots_description">The time drawn on a grid of dots</string>
+    <string name="clock_ring_name">Cincin</string>
+    <string name="clock_ring_description">The time inside a ring that fills as the day goes by</string>
+</resources>

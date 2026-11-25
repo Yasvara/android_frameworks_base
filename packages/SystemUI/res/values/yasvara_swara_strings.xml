@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+    <!-- Volume Panel "Apps" -->
+    <string name="swara_apps_title">Apps</string>
+    <string name="swara_apps_empty">No app is playing sound</string>
+    <string name="swara_apps_muted">Muted</string>
+    <string name="swara_mic_gain">Mic level <xliff:g id="percent" example="100">%1$d</xliff:g>%%</string>
+    <string name="swara_share_mic">Share mic during calls</string>
+    <string name="swara_share_mic_warning">Both apps hear your mic; the other app may also hear the call through the speaker.</string>
+    <string name="swara_output_system">Same as system</string>
+    <string name="swara_output_speaker">Phone speaker</string>
+    <string name="swara_apps_manage">Manage</string>
+    <plurals name="swara_apps_closed">
+        <item quantity="one"><xliff:g id="count" example="1">%1$d</xliff:g> closed app has its own volume</item>
+        <item quantity="other"><xliff:g id="count" example="2">%1$d</xliff:g> closed apps have their own volume</item>
+    </plurals>
+    <!-- Volume dialog (2026-10-07) -->
+    <string name="swara_dialog_apps">App volumes</string>
+    <string name="swara_dialog_mute">Mute <xliff:g id="app" example="Spotify">%1$s</xliff:g></string>
+    <string name="swara_dialog_unmute">Unmute <xliff:g id="app" example="Spotify">%1$s</xliff:g></string>
+    <string name="swara_dialog_muted_short">Off</string>
+</resources>

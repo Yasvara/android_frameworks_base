@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+    <string name="layang_chip_description">Jendela mengambang</string>
+    <string name="layang_dialog_title">Jendela mengambang</string>
+    <string name="layang_dialog_empty">Tidak ada jendela mengambang</string>
+    <string name="layang_dialog_open_app">Buka aplikasi</string>
+    <string name="layang_dialog_close_all">Tutup semua</string>
+    <string name="layang_dialog_done">Selesai</string>
+    <string name="layang_state_floating">Mengambang</string>
+    <string name="layang_state_mini">Mini</string>
+    <string name="layang_state_parked">Diparkir</string>
+    <string name="layang_state_parked_memory">Diparkir untuk menghemat memori</string>
+    <string name="layang_close_window">Tutup <xliff:g id="app" example="Genshin Impact">%1$s</xliff:g></string>
+    <string name="layang_picker_title">Buka sebagai jendela mengambang</string>
+    <string name="layang_picker_search">Cari aplikasi</string>
+    <string name="layang_notification_open_floating">Buka mengambang</string>
+</resources>

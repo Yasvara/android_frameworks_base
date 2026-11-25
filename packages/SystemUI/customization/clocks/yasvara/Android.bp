@@ -1,0 +1,30 @@
+//
+// SPDX-FileCopyrightText: The Yasvara Project
+// SPDX-License-Identifier: Apache-2.0
+//
+
+package {
+    default_applicable_licenses: ["frameworks_base_packages_SystemUI_license"],
+}
+
+// Yasvara's lock screen clock faces. SystemUI registers them next to the default clock, and
+// Laras links the same library to draw its clock thumbnails, so both show identical faces.
+android_library {
+    name: "SystemUIClocks-YasvaraLib",
+    manifest: "AndroidManifest.xml",
+    use_resource_processor: true,
+    srcs: ["src/**/*.kt"],
+    resource_dirs: ["res"],
+    libs: ["SystemUIPluginLib"],
+    static_libs: [
+        "SystemUIClocks-CommonLib",
+        "androidx.graphics_graphics-shapes",
+        "monet",
+    ],
+    min_sdk_version: "current",
+    kotlincflags: ["-Xjvm-default=all"],
+    optimize: {
+        included_proguard_flags_files: [":sysui_proguard_kotlin"],
+        export_proguard_flags_files: true,
+    },
+}

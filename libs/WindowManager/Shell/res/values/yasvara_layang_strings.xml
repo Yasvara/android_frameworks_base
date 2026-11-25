@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<!-- Layang floating windows -->
+<resources>
+    <string name="layang_pill_description">Floating window handle. Drag to move, tap for the menu.</string>
+    <string name="layang_action_bigger">Bigger</string>
+    <string name="layang_action_smaller">Smaller</string>
+    <string name="layang_action_fullscreen">Fullscreen</string>
+    <string name="layang_action_mini">Mini window</string>
+    <string name="layang_action_close">Close</string>
+
+    <string name="layang_menu_fullscreen">Fullscreen</string>
+    <string name="layang_menu_mini">Mini window</string>
+    <string name="layang_menu_ghost">Ghost (touch passes through)</string>
+    <string name="layang_menu_unghost">Leave ghost</string>
+    <string name="layang_menu_lock">Lock window</string>
+    <string name="layang_menu_unlock">Unlock window</string>
+    <string name="layang_menu_volume">App sound</string>
+    <string name="layang_menu_mute">Mute</string>
+    <string name="layang_menu_unmute">Unmute</string>
+    <string name="layang_menu_always">Always open floating</string>
+    <string name="layang_menu_screenshot">Screenshot window</string>
+    <string name="layang_menu_app_info">App info</string>
+    <string name="layang_menu_minimize">Minimize to recents</string>
+    <string name="layang_menu_close">Close</string>
+
+    <string name="layang_always_on">This app will always open floating</string>
+    <string name="layang_always_off">This app opens normally again</string>
+    <string name="layang_screenshot_saved">Window screenshot saved</string>
+    <string name="layang_screenshot_failed">Couldn\'t take the window screenshot</string>
+
+    <string name="layang_menu_rotate">Rotate window</string>
+    <string name="layang_menu_reflow">Reflow layout (app re-lays out for the window)</string>
+    <string name="layang_menu_ratio">Window shape %1$s</string>
+    <string name="layang_reflow_on">This app now re-lays out for its window</string>
+    <string name="layang_reflow_off">This app now scales like a phone screen</string>
+</resources>

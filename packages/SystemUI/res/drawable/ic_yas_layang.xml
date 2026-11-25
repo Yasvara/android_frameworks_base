@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<!-- Material Symbols "pip" style: a floating window over a screen (Layang). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+        android:width="24dp"
+        android:height="24dp"
+        android:viewportWidth="24"
+        android:viewportHeight="24"
+        android:tint="?android:attr/colorControlNormal">
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M4,20q-0.825,0 -1.412,-0.587Q2,18.825 2,18V6q0,-0.825 0.588,-1.412Q3.175,4 4,4h16q0.825,0 1.413,0.588Q22,5.175 22,6v12q0,0.825 -0.587,1.413Q20.825,20 20,20zM4,18h16V6H4zM11,17h7q0.425,0 0.712,-0.288Q19,16.425 19,16v-5q0,-0.425 -0.288,-0.713Q18.425,10 18,10h-7q-0.425,0 -0.712,0.287Q10,10.575 10,11v5q0,0.425 0.288,0.712Q10.575,17 11,17z" />
+</vector>

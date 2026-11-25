@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-FileCopyrightText: The Yasvara Project
+     SPDX-License-Identifier: Apache-2.0
+-->
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+    <string name="swara_apps_title">Aplikasi</string>
+    <string name="swara_apps_empty">Tidak ada aplikasi yang memutar suara</string>
+    <string name="swara_apps_muted">Dibisukan</string>
+    <string name="swara_mic_gain">Level mikrofon <xliff:g id="percent" example="100">%1$d</xliff:g>%%</string>
+    <string name="swara_share_mic">Bagi mikrofon saat panggilan</string>
+    <string name="swara_share_mic_warning">Kedua aplikasi mendengar mikrofon Anda; aplikasi lain juga bisa mendengar panggilan lewat speaker.</string>
+    <string name="swara_output_system">Sama dengan sistem</string>
+    <string name="swara_output_speaker">Speaker ponsel</string>
+    <string name="swara_apps_manage">Kelola</string>
+    <plurals name="swara_apps_closed">
+        <item quantity="other"><xliff:g id="count" example="2">%1$d</xliff:g> aplikasi tertutup punya volume sendiri</item>
+    </plurals>
+    <string name="swara_dialog_apps">Volume aplikasi</string>
+    <string name="swara_dialog_mute">Bisukan <xliff:g id="app" example="Spotify">%1$s</xliff:g></string>
+    <string name="swara_dialog_unmute">Bunyikan <xliff:g id="app" example="Spotify">%1$s</xliff:g></string>
+    <string name="swara_dialog_muted_short">Mati</string>
+</resources>
