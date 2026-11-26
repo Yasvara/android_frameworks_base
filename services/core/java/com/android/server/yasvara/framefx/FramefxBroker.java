@@ -116,6 +116,11 @@ public final class FramefxBroker extends Binder {
     private static final int LAPIS_FLAGS = 2;
     private static final int LAPIS_TEXT_TAP = 1 << 1;
     private static final int LAPIS_SOUND_TAP = 1 << 3;
+    private static final int LAPIS_SOUND_PATCH = 1 << 4;
+    /** Sound tap levels: none, the engine's slots and vtables, and code patches as well. */
+    public static final int SOUNDS_OFF = 0;
+    public static final int SOUNDS_TAP = 1;
+    public static final int SOUNDS_PATCH = 2;
     private static final byte[] LAPIS_DEFAULT = {1, 1, 0, 0};
 
     // Lepas: lepasd finds an armed game's fps cap from outside it and holds it at the target. The
@@ -378,7 +383,9 @@ public final class FramefxBroker extends Binder {
         } else if (args.length >= 3 && "sounds".equals(args[0])) {
             final long token = Binder.clearCallingIdentity();
             try {
-                code = setLapisFlag(args[1], LAPIS_SOUND_TAP, "on".equals(args[2]));
+                final int level = "patch".equals(args[2]) ? SOUNDS_PATCH
+                        : "on".equals(args[2]) ? SOUNDS_TAP : SOUNDS_OFF;
+                code = setSoundTap(args[1], level);
             } finally {
                 Binder.restoreCallingIdentity(token);
             }
@@ -421,7 +428,7 @@ public final class FramefxBroker extends Binder {
             pw.println("       video-kelir <package> <section hex>|off");
             pw.println("       video <package> <section hex>|off");
             pw.println("       alih <package> on|off");
-            pw.println("       sounds <package> on|off");
+            pw.println("       sounds <package> on|patch|off");
             pw.println("       lepas <package> <fps>|off|status");
         }
         result.send(code == OK ? 0 : -1, null);
@@ -539,12 +546,14 @@ public final class FramefxBroker extends Binder {
 
     /** One Lapis flag, its other fields kept; takes effect at the game's next start. */
     private int setLapisFlag(String pkg, int flag, boolean on) {
-        final byte[] current = getSection(pkg, LAPIS_SECTION);
-        final byte[] next = current != null && current.length == LAPIS_DEFAULT.length
-                ? current.clone() : LAPIS_DEFAULT.clone();
-        next[LAPIS_FLAGS] = (byte) (on ? next[LAPIS_FLAGS] | flag : next[LAPIS_FLAGS] & ~flag);
-        return setSection(pkg, LAPIS_SECTION,
-                java.util.Arrays.equals(next, LAPIS_DEFAULT) ? new byte[0] : next);
+        synchronized (mLock) {
+            final byte[] current = getSection(pkg, LAPIS_SECTION);
+            final byte[] next = current != null && current.length == LAPIS_DEFAULT.length
+                    ? current.clone() : LAPIS_DEFAULT.clone();
+            next[LAPIS_FLAGS] = (byte) (on ? next[LAPIS_FLAGS] | flag : next[LAPIS_FLAGS] & ~flag);
+            return setSection(pkg, LAPIS_SECTION,
+                    java.util.Arrays.equals(next, LAPIS_DEFAULT) ? new byte[0] : next);
+        }
     }
 
     /** Whether a package of this uid has its Lapis section tap its sound calls. */
@@ -613,27 +622,40 @@ public final class FramefxBroker extends Binder {
         return null;
     }
 
-    /** Packages whose Lapis section taps their sound calls. */
-    public java.util.Set<String> soundTapped() {
-        final java.util.Set<String> out = new java.util.HashSet<>();
+    private static int soundLevel(@Nullable byte[] lapis) {
+        if (lapis == null || lapis.length <= LAPIS_FLAGS
+                || (lapis[LAPIS_FLAGS] & LAPIS_SOUND_TAP) == 0) {
+            return SOUNDS_OFF;
+        }
+        return (lapis[LAPIS_FLAGS] & LAPIS_SOUND_PATCH) != 0 ? SOUNDS_PATCH : SOUNDS_TAP;
+    }
+
+    /** Packages whose Lapis section taps their sound calls, by level. */
+    public java.util.Map<String, Integer> soundTapped() {
+        final java.util.Map<String, Integer> out = new java.util.HashMap<>();
         synchronized (mLock) {
             for (int i = 0; i < mChannels.size(); i++) {
-                final byte[] lapis = mChannels.valueAt(i).sections.get(LAPIS_SECTION);
-                if (lapis != null && lapis.length > LAPIS_FLAGS
-                        && (lapis[LAPIS_FLAGS] & LAPIS_SOUND_TAP) != 0) {
-                    out.add(mChannels.keyAt(i));
-                }
+                final int level = soundLevel(mChannels.valueAt(i).sections.get(LAPIS_SECTION));
+                if (level != SOUNDS_OFF) out.put(mChannels.keyAt(i), level);
             }
         }
         return out;
     }
 
-    /** Taps a package's sound calls or stops it, the rest of its Lapis section kept. */
-    public void setSoundTap(String pkg, boolean on) {
-        final byte[] current = getSection(pkg, LAPIS_SECTION);
-        final boolean tapped = current != null && current.length > LAPIS_FLAGS
-                && (current[LAPIS_FLAGS] & LAPIS_SOUND_TAP) != 0;
-        if (tapped != on) setLapisFlag(pkg, LAPIS_SOUND_TAP, on);
+    /** Sets how a package's sound calls are tapped, the rest of its Lapis section kept. */
+    public int setSoundTap(String pkg, int level) {
+        synchronized (mLock) {
+            final byte[] current = getSection(pkg, LAPIS_SECTION);
+            if (soundLevel(current) == level) return OK;
+            final byte[] next = current != null && current.length == LAPIS_DEFAULT.length
+                    ? current.clone() : LAPIS_DEFAULT.clone();
+            int flags = next[LAPIS_FLAGS] & ~(LAPIS_SOUND_TAP | LAPIS_SOUND_PATCH);
+            if (level >= SOUNDS_TAP) flags |= LAPIS_SOUND_TAP;
+            if (level >= SOUNDS_PATCH) flags |= LAPIS_SOUND_PATCH;
+            next[LAPIS_FLAGS] = (byte) flags;
+            return setSection(pkg, LAPIS_SECTION,
+                    java.util.Arrays.equals(next, LAPIS_DEFAULT) ? new byte[0] : next);
+        }
     }
 
     /** A game process that taps its text asks for the memory it shares with Alih. */

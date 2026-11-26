@@ -83,6 +83,14 @@ public final class HentakService extends Binder {
 
     private static final String KEY_MODE = "pentas_hentak";
     private static final String KEY_SENSITIVITY = "pentas_hentak_sens";
+    /** Where hits come from, per game: SOURCE_AUDIO, SOURCE_EVENTS or SOURCE_PATCH. */
+    private static final String KEY_SOURCE = "pentas_hentak_source";
+    private static final int SOURCE_AUDIO = 0;
+    private static final int SOURCE_EVENTS = 1;
+    private static final int SOURCE_PATCH = 2;
+    /** Games whose anti-cheat watches their process closely: the mixed audio alone by default. */
+    private static final java.util.Set<String> AUDIO_ONLY_BY_DEFAULT = java.util.Set.of(
+            "com.garena.game.df", "com.proxima.dfm", "com.tencent.tmgp.dfm");
     private static final String KEY_GAME_FOCUS = "pentas_game_focus";
 
     static final int MODE_OFF = 0;
@@ -156,6 +164,8 @@ public final class HentakService extends Binder {
                 Settings.System.getUriFor(KEY_MODE), false, observer, UserHandle.USER_ALL);
         context.getContentResolver().registerContentObserver(
                 Settings.System.getUriFor(KEY_SENSITIVITY), false, observer, UserHandle.USER_ALL);
+        context.getContentResolver().registerContentObserver(
+                Settings.System.getUriFor(KEY_SOURCE), false, observer, UserHandle.USER_ALL);
         context.getContentResolver().registerContentObserver(Settings.System.getUriFor(
                 Settings.System.HARDWARE_HAPTIC_FEEDBACK_INTENSITY), false, observer,
                 UserHandle.USER_ALL);
@@ -242,7 +252,7 @@ public final class HentakService extends Binder {
             mNoMmap = noMmap;
             AudioSystem.setParameters("hentak_nommap=" + noMmap);
         }
-        tapSounds(enabledPackages(user));
+        tapSounds(enabledPackages(user), user);
         final float gain = gain(user);
         if (uid == mUid && mode == mMode && sens == mSensitivity && gain == mGain) return;
         final boolean newGame = uid >= 0 && uid != mUid;
@@ -263,17 +273,31 @@ public final class HentakService extends Binder {
         Slog.i(TAG, mode == MODE_OFF ? "Disarmed" : "Armed " + pkg + " mode " + mode + " sens " + sens);
     }
 
-    /** Has framefx tap the sound calls of exactly these packages, from their next start. */
-    private void tapSounds(java.util.Set<String> packages) {
+    /**
+     * Has framefx tap the sound calls of exactly these packages as far as each one's source
+     * allows, from their next start. Audio taps nothing: Hentak hears the mix alone.
+     */
+    private void tapSounds(java.util.Set<String> packages, int user) {
         final FramefxBroker broker = FramefxBroker.get();
         if (broker == null) return;
-        final java.util.Set<String> tapped = broker.soundTapped();
+        final java.util.Map<String, Integer> tapped = broker.soundTapped();
         for (String pkg : packages) {
-            if (!tapped.contains(pkg)) broker.setSoundTap(pkg, true);
+            final int source = source(pkg, user);
+            final int level = source == SOURCE_PATCH ? FramefxBroker.SOUNDS_PATCH
+                    : source == SOURCE_EVENTS ? FramefxBroker.SOUNDS_TAP : FramefxBroker.SOUNDS_OFF;
+            if (tapped.getOrDefault(pkg, FramefxBroker.SOUNDS_OFF) != level) {
+                broker.setSoundTap(pkg, level);
+            }
         }
-        for (String pkg : tapped) {
-            if (!packages.contains(pkg)) broker.setSoundTap(pkg, false);
+        for (String pkg : tapped.keySet()) {
+            if (!packages.contains(pkg)) broker.setSoundTap(pkg, FramefxBroker.SOUNDS_OFF);
         }
+    }
+
+    private int source(String pkg, int user) {
+        final int fallback = AUDIO_ONLY_BY_DEFAULT.contains(pkg) ? SOURCE_AUDIO : SOURCE_EVENTS;
+        return (int) Math.max(SOURCE_AUDIO, Math.min(SOURCE_PATCH,
+                perApp(KEY_SOURCE, pkg, user, fallback)));
     }
 
     /** Every package Pentas has Hentak on for. */
