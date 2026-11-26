@@ -1866,6 +1866,18 @@ public final class SystemServer implements Dumpable {
             }
             t.traceEnd();
 
+            // Yasvara: Tempel NFC card vault, profile switching, and tag engine. Never fatal:
+            // without it NFC behaves identically to stock.
+            t.traceBegin("StartYasvaraTempelService");
+            try {
+                ServiceManager.addService(
+                        com.android.server.yasvara.tempel.YasvaraTempelService.SERVICE_NAME,
+                        new com.android.server.yasvara.tempel.YasvaraTempelService(context));
+            } catch (Throwable e) {
+                Slog.e("SystemServer", "Failed to start YasvaraTempelService", e);
+            }
+            t.traceEnd();
+
             t.traceBegin("StartYasvaraAppVisibilityService");
             try {
                 ServiceManager.addService(

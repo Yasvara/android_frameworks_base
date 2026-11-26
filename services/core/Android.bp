@@ -123,8 +123,19 @@ filegroup {
 }
 
 filegroup {
+    name: "yasvara-tempel-aidl",
+    srcs: ["java/com/android/server/yasvara/tempel/IYasvaraTempel.aidl"],
+    path: "java",
+    visibility: [
+        "//packages/apps/Laras",
+        "//vendor:__subpackages__",
+    ],
+}
+
+filegroup {
     name: "services.core-aidl-sources",
     srcs: [
+        ":yasvara-tempel-aidl",
         ":yasvara-root-aidl",
         ":yasvara-ketik-aidl",
         ":yasvara-lelap-aidl",
