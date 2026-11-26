@@ -115,7 +115,8 @@ public final class PentasService extends Binder {
     static final int MODE_GAME = 1;
     static final int MODE_VIDEO = 2;
 
-    // Pentas's lists, Settings.System per user.
+    // Pentas's lists, Settings.System per user: "pkg=1;pkg=0", where =0 takes out an app the
+    // automatic detection picked (a bare package counts as =1).
     private static final String KEY_GAME_LIST = "pentas_game_list";
     private static final String KEY_AUTO_DETECT = "pentas_auto_game_detect";
     private static final String KEY_VIDEO_LIST = "sidebar_video_list";
@@ -1028,11 +1029,11 @@ public final class PentasService extends Binder {
         final int type = top != null ? top.getActivityType() : ACTIVITY_TYPE_HOME;
         mTopPackage = pkg;
         mTopTaskId = top != null ? top.taskId : -1;
-        mThermalBridge.onForegroundChanged(pkg != null ? pkg : "");
 
         final int user = ActivityManager.getCurrentUser();
         final int mode = pkg == null || type == ACTIVITY_TYPE_HOME || type == ACTIVITY_TYPE_RECENTS
                 ? MODE_NONE : modeOf(pkg, user);
+        mThermalBridge.onForegroundChanged(pkg != null ? pkg : "", mode);
 
         if (mode == MODE_NONE) {
             endSession();
@@ -1236,15 +1237,9 @@ public final class PentasService extends Binder {
 
     @Nullable
     private Integer classify(String pkg, int user) {
-        final String games = Settings.System.getStringForUser(
-                mContext.getContentResolver(), KEY_GAME_LIST, user);
-        if (games != null) {
-            for (String entry : games.split(";")) {
-                final int eq = entry.indexOf('=');
-                final String name = eq >= 0 ? entry.substring(0, eq) : entry;
-                if (pkg.equals(name)) return MODE_GAME;
-            }
-        }
+        final int listedGame = listEntry(Settings.System.getStringForUser(
+                mContext.getContentResolver(), KEY_GAME_LIST, user), pkg);
+        if (listedGame == 1) return MODE_GAME;
         final ApplicationInfo info;
         try {
             info = mContext.getPackageManager().getApplicationInfoAsUser(pkg, 0, user);
@@ -1256,18 +1251,11 @@ public final class PentasService extends Binder {
         @SuppressWarnings("deprecation")
         final boolean isGame = info.category == ApplicationInfo.CATEGORY_GAME
                 || (info.flags & ApplicationInfo.FLAG_IS_GAME) != 0;
-        if (autoDetect && isGame) return MODE_GAME;
+        if (autoDetect && isGame && listedGame != 0) return MODE_GAME;
 
-        final String videos = Settings.System.getStringForUser(
-                mContext.getContentResolver(), KEY_VIDEO_LIST, user);
-        if (videos != null) {
-            for (String entry : videos.split(";")) {
-                final int eq = entry.indexOf('=');
-                if (eq > 0 && pkg.equals(entry.substring(0, eq))) {
-                    return "1".equals(entry.substring(eq + 1)) ? MODE_VIDEO : MODE_NONE;
-                }
-            }
-        }
+        final int listedVideo = listEntry(Settings.System.getStringForUser(
+                mContext.getContentResolver(), KEY_VIDEO_LIST, user), pkg);
+        if (listedVideo >= 0) return listedVideo == 1 ? MODE_VIDEO : MODE_NONE;
         if (info.category == ApplicationInfo.CATEGORY_VIDEO
                 || info.category == ApplicationInfo.CATEGORY_AUDIO) {
             return MODE_VIDEO;
@@ -1277,6 +1265,19 @@ public final class PentasService extends Binder {
             if (lower.contains(hint)) return MODE_VIDEO;
         }
         return MODE_NONE;
+    }
+
+    /** 1 when a list adds {@code pkg}, 0 when it takes it out, -1 when it does not name it. */
+    private static int listEntry(@Nullable String list, String pkg) {
+        if (list == null) return -1;
+        for (String entry : list.split(";")) {
+            final int eq = entry.indexOf('=');
+            final String name = (eq >= 0 ? entry.substring(0, eq) : entry).trim();
+            if (pkg.equals(name)) {
+                return eq >= 0 && "0".equals(entry.substring(eq + 1).trim()) ? 0 : 1;
+            }
+        }
+        return -1;
     }
 
     @Override
@@ -1297,6 +1298,7 @@ public final class PentasService extends Binder {
                             .append(mode == MODE_GAME ? "GAME" : "VIDEO").append('\n');
                 }
             }
+            mThermalBridge.dump(out);
         }, 1000);
         pw.print(done ? out : "Pentas: handler busy\n");
     }

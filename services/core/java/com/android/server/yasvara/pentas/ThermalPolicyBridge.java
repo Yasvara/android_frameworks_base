@@ -140,6 +140,16 @@ final class ThermalPolicyBridge {
         -2, // 16: Battery Saver
     };
 
+    /** Scene for Auto. The kernel boots at -1, which mca_smart_charge's scene ignores. */
+    private static final int SCONFIG_DEFAULT = 0;
+
+    // mithermal_bypass_charging (Pentas ThermalNodes.BYPASS_MODE_*). The node only ever gets
+    // BYPASS_OFF or BYPASS_ALWAYS: the kernel's AUTO keys on the thermal scene, not on the app.
+    private static final int BYPASS_OFF = 0;
+    private static final int BYPASS_ALWAYS = 1;
+    private static final int BYPASS_GAMES = 2;
+    private static final int BYPASS_GAMES_VIDEO = 3;
+
     private static final String[] PROFILE_SS_NAMES = {
         "default", "default", "performance", "gaming", "heavy_gaming",
         "genshin", "hsr", "high_fps", "camera", "recording_4k", "video",
@@ -162,10 +172,13 @@ final class ThermalPolicyBridge {
 
     // ── Applied state ───────────────────────────────────────────────────────
     private String mForegroundPackage = "";
+    private int mForegroundMode = PentasService.MODE_NONE;
+    private boolean mScreenOn = true;
     private int mActiveProfileIndex = -1;
     private int mAppliedSconfig = -1;
-    private int mOriginalSconfig = 0;
     private boolean mGameBoostActive;
+    /** Last value written to the bypass node, -1 before the first write. */
+    private int mAppliedBypass = -1;
     private int mCustomRevision;
     private int mAppliedCustomRevision = -1;
 
@@ -209,7 +222,10 @@ final class ThermalPolicyBridge {
         mActive = true;
         mMaxWatt = detectMaxWatt();
         mChargeMaxWatt = mMaxWatt;
-        mOriginalSconfig = readIntNode(NODE_SCONFIG, 0);
+        // A scene and boost left by an earlier system_server count as applied, so Auto clears them.
+        final int liveScene = readIntNode(NODE_SCONFIG, -1);
+        mAppliedSconfig = liveScene > SCONFIG_DEFAULT ? liveScene : -1;
+        mGameBoostActive = "1".equals(readNode(NODE_THERMAL_BOOST));
         if ("1".equals(readNode(NODE_SCHED_BOOST))) {
             writeNodeIfExists(NODE_SCHED_BOOST, "0");
             Slog.w(TAG, "Cleared stale sched_boost=1");
@@ -228,7 +244,8 @@ final class ThermalPolicyBridge {
         registerObservers(cr);
 
         final PowerManager pm = mContext.getSystemService(PowerManager.class);
-        writeNode(NODE_SCREEN_STATE, (pm == null || pm.isInteractive()) ? "1" : "0");
+        mScreenOn = pm == null || pm.isInteractive();
+        writeNode(NODE_SCREEN_STATE, mScreenOn ? "1" : "0");
 
         // Prime daemon properties
         SystemProperties.set(PROP_TEMP_LIMIT, Integer.toString(mTempLimit));
@@ -240,18 +257,39 @@ final class ThermalPolicyBridge {
         Slog.i(TAG, "ThermalPolicyBridge started (maxWatt=" + mMaxWatt + ")");
     }
 
-    /** Called on {@code mHandler} whenever PentasService resolves a new foreground package. */
-    void onForegroundChanged(@NonNull String pkg) {
-        if (!mActive || pkg.equals(mForegroundPackage)) return;
+    /**
+     * Called on {@code mHandler} each time PentasService resolves the foreground app, with its
+     * session mode; the mode also changes on its own when the game or video list is edited.
+     */
+    void onForegroundChanged(@NonNull String pkg, int mode) {
+        if (!mActive) return;
+        final boolean switched = !pkg.equals(mForegroundPackage);
         mForegroundPackage = pkg;
-        reconcile();
-        applyChargingProfile();
+        mForegroundMode = mode;
+        if (switched) {
+            reconcile();
+            applyChargingProfile();
+        }
+        applyBypassCharging();
     }
 
     /** Called on {@code mHandler} from PentasService's screen receiver. */
     void onScreenStateChanged(boolean screenOn) {
         if (!mActive) return;
+        mScreenOn = screenOn;
         writeNode(NODE_SCREEN_STATE, screenOn ? "1" : "0");
+        applyBypassCharging();
+    }
+
+    /** Handler thread only. */
+    void dump(@NonNull StringBuilder out) {
+        if (!mActive) return;
+        out.append("  thermal: scene=").append(mAppliedSconfig)
+                .append(" profile=").append(mActiveProfileIndex)
+                .append(" boost=").append(mGameBoostActive)
+                .append(" bypass=").append(mAppliedBypass)
+                .append(" fg=").append(mForegroundPackage).append(" mode=").append(mForegroundMode)
+                .append(" screen=").append(mScreenOn ? "on" : "off").append('\n');
     }
 
     /** Called on {@code mHandler} on user switch/unlock. */
@@ -326,8 +364,9 @@ final class ThermalPolicyBridge {
                 || uri.contains(KEY_CHG_APP_PROFILES)) {
             mChargingRevision++;
             applyChargingProfile();
+            applyBypassCharging();
         } else if (uri.contains(KEY_BYPASS_CHARGING)) {
-            applyBypassCharging(true);
+            applyBypassCharging();
         } else if (uri.contains(KEY_HBM_ENABLED) || uri.contains(KEY_HBM_TIMEOUT)) {
             applyHbm();
         } else if (uri.contains(KEY_DC_DIMMING)) {
@@ -398,7 +437,7 @@ final class ThermalPolicyBridge {
         SystemProperties.set(PROP_TEMP_LIMIT, Integer.toString(mTempLimit));
         SystemProperties.set(PROP_TEMP_OFFSET, Integer.toString(mTempOffset));
         applyChargingProfile();
-        applyBypassCharging(false);
+        applyBypassCharging();
         applyHbm();
         applyDcDimming();
     }
@@ -422,9 +461,9 @@ final class ThermalPolicyBridge {
 
     private void applySconfig(int profileIndex) {
         final int sconfig = PROFILE_SCONFIG[profileIndex];
-        if (sconfig == -1) { // Auto
-            if (mAppliedSconfig != -1 && mOriginalSconfig >= 0) {
-                writeNode(NODE_SCONFIG, Integer.toString(mOriginalSconfig));
+        if (sconfig == -1) { // Auto: back to the default scene
+            if (mAppliedSconfig != -1) {
+                writeNode(NODE_SCONFIG, Integer.toString(SCONFIG_DEFAULT));
                 writeNode(NODE_POWERSAVE_MODE, "0");
                 mAppliedSconfig = -1;
                 mActiveProfileIndex = -1;
@@ -585,8 +624,13 @@ final class ThermalPolicyBridge {
                 if (caps != null && caps.length() > 0) wire.put("caps", caps);
                 final JSONArray ladder = policy.optJSONArray("ladder");
                 if (ladder != null && ladder.length() > 0) wire.put("ladder", ladder);
+                // Tunables only: applyBypassCharging alone turns bypass on and off.
                 final JSONObject bypass = policy.optJSONObject("bypass");
-                if (bypass != null && bypass.length() > 0) wire.put("bypass", bypass);
+                if (bypass != null) {
+                    final JSONObject tune = new JSONObject(bypass.toString());
+                    tune.remove("mode");
+                    if (tune.length() > 0) wire.put("bypass", tune);
+                }
 
                 final JSONObject dyn = policy.optJSONObject("dynamics");
                 populateDynamicsProps(dyn, pre);
@@ -642,21 +686,26 @@ final class ThermalPolicyBridge {
 
     @Nullable
     private String resolveActiveChargingProfileId(@Nullable String pkg) {
-        final ContentResolver cr = mContext.getContentResolver();
-        final int user = ActivityManager.getCurrentUser();
-        if (pkg != null && !pkg.isEmpty()) {
-            final String appRaw = Settings.System.getStringForUser(cr, KEY_CHG_APP_PROFILES, user);
-            if (appRaw != null && !appRaw.isEmpty()) {
-                try {
-                    final JSONObject map = new JSONObject(appRaw);
-                    final String id = map.optString(pkg, "");
-                    if (!id.isEmpty()) return id;
-                } catch (JSONException ignored) {
-                }
-            }
-        }
-        final String global = Settings.System.getStringForUser(cr, KEY_CHG_GLOBAL_PROFILE, user);
+        final String own = appChargingProfileId(pkg);
+        if (own != null) return own;
+        final String global = Settings.System.getStringForUser(mContext.getContentResolver(),
+                KEY_CHG_GLOBAL_PROFILE, ActivityManager.getCurrentUser());
         return (global != null && !global.isEmpty()) ? global : null;
+    }
+
+    /** The app's own charging profile, or null when it follows the global one. */
+    @Nullable
+    private String appChargingProfileId(@Nullable String pkg) {
+        if (pkg == null || pkg.isEmpty()) return null;
+        final String appRaw = Settings.System.getStringForUser(mContext.getContentResolver(),
+                KEY_CHG_APP_PROFILES, ActivityManager.getCurrentUser());
+        if (appRaw == null || appRaw.isEmpty()) return null;
+        try {
+            final String id = new JSONObject(appRaw).optString(pkg, "");
+            return id.isEmpty() ? null : id;
+        } catch (JSONException e) {
+            return null;
+        }
     }
 
     @Nullable
@@ -680,28 +729,50 @@ final class ThermalPolicyBridge {
         SystemProperties.set(PROP_MIN_FCC, Long.toString(wattToUa(mChargeMinWatt)));
     }
 
-    private void applyBypassCharging(boolean fromExplicitToggle) {
-        final int user = ActivityManager.getCurrentUser();
-        final int mode = clamp(
-                Settings.System.getIntForUser(
-                        mContext.getContentResolver(), KEY_BYPASS_CHARGING, 0, user),
-                0, 2);
-
-        if (!fromExplicitToggle && mode == 0) {
-            final String activeId = resolveActiveChargingProfileId(mForegroundPackage);
-            final JSONObject prof = activeId != null ? findChargingProfile(activeId) : null;
-            final JSONObject policy = prof != null ? prof.optJSONObject("policy") : null;
-            final JSONObject bypass = policy != null ? policy.optJSONObject("bypass") : null;
-            if (bypass != null && bypass.optInt("mode", 0) != 0) {
-                return;
-            }
+    /**
+     * The only writer of the bypass node. Games and Games + video hold the adapter only while
+     * such an app is in front with the screen on; with the screen off the pack charges again.
+     */
+    private void applyBypassCharging() {
+        final int requested = requestedBypassMode();
+        if (!new File(NODE_BYPASS_CHARGE).exists()) {
+            writeNodeIfExists(NODE_SMART_NIGHT, requested != BYPASS_OFF ? "1" : "0");
+            return;
         }
-
-        if (new File(NODE_BYPASS_CHARGE).exists()) {
-            writeNode(NODE_BYPASS_CHARGE, Integer.toString(mode));
+        final boolean on;
+        if (requested == BYPASS_ALWAYS) {
+            on = true;
+        } else if (requested == BYPASS_GAMES) {
+            on = mScreenOn && mForegroundMode == PentasService.MODE_GAME;
+        } else if (requested == BYPASS_GAMES_VIDEO) {
+            on = mScreenOn && mForegroundMode != PentasService.MODE_NONE;
         } else {
-            writeNodeIfExists(NODE_SMART_NIGHT, mode != 0 ? "1" : "0");
+            on = false;
         }
+        final int value = on ? BYPASS_ALWAYS : BYPASS_OFF;
+        if (value == mAppliedBypass) return;
+        writeNode(NODE_BYPASS_CHARGE, Integer.toString(value));
+        mAppliedBypass = value;
+        Slog.i(TAG, "Bypass " + (on ? "on" : "off") + " (mode " + requested + ", "
+                + mForegroundPackage + ")");
+    }
+
+    /**
+     * The global setting. Picking a charging profile copies its bypass mode there, so a profile
+     * only adds its own when it is the foreground app's and the setting is off.
+     */
+    private int requestedBypassMode() {
+        final int global = clamp(Settings.System.getIntForUser(mContext.getContentResolver(),
+                KEY_BYPASS_CHARGING, BYPASS_OFF, ActivityManager.getCurrentUser()),
+                BYPASS_OFF, BYPASS_GAMES_VIDEO);
+        if (global != BYPASS_OFF) return global;
+        final String own = appChargingProfileId(mForegroundPackage);
+        final JSONObject profile = own != null ? findChargingProfile(own) : null;
+        final JSONObject policy = profile != null ? profile.optJSONObject("policy") : null;
+        final JSONObject bypass = policy != null ? policy.optJSONObject("bypass") : null;
+        return bypass != null
+                ? clamp(bypass.optInt("mode", BYPASS_OFF), BYPASS_OFF, BYPASS_GAMES_VIDEO)
+                : BYPASS_OFF;
     }
 
     // ── HBM & DC Dimming ────────────────────────────────────────────────────
