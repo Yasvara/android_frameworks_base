@@ -2028,20 +2028,8 @@ static bool ReadFileBytes(const char* path, std::vector<uint8_t>& out, size_t ma
     return true;
 }
 
-static bool ReadLeU32(const std::vector<uint8_t>& buf, size_t& at, uint32_t& out) {
-    if (at + 4 > buf.size()) return false;
-    memcpy(&out, buf.data() + at, 4);
-    at += 4;
-    return true;
-}
-
-static bool ReadLeStr(const std::vector<uint8_t>& buf, size_t& at, std::string& out, size_t max_len) {
-    uint32_t len = 0;
-    if (!ReadLeU32(buf, at, len) || len > max_len || at + len > buf.size()) return false;
-    out.assign(reinterpret_cast<const char*>(buf.data() + at), len);
-    at += len;
-    return true;
-}
+using yasvara::tabir::ReadLeStr;
+using yasvara::tabir::ReadLeU32;
 
 static void TabirRefreshEnrolledCache() {
     struct stat st;
@@ -2173,63 +2161,38 @@ static void TabirRefreshZygiskCache() {
         return;
     }
     std::vector<uint8_t> raw;
-    if (!ReadFileBytes(kTabirZygiskPath, raw, 512 * 1024) || raw.size() < 20 ||
-        memcmp(raw.data(), "AKZG", 4) != 0) {
+    yasvara::tabir::ZygiskSet set;
+    if (!ReadFileBytes(kTabirZygiskPath, raw, 512 * 1024) ||
+        !yasvara::tabir::ParseZygiskSet(raw, set)) {
         return;
     }
-    size_t at = 4;
-    uint32_t ver = 0, flags = 0, dc = 0, mc = 0;
-    if (!ReadLeU32(raw, at, ver) || ver != 1 || !ReadLeU32(raw, at, flags) ||
-        !ReadLeU32(raw, at, dc) || dc > 65536) {
-        return;
-    }
-    std::vector<uint32_t> deny(dc);
-    for (uint32_t i = 0; i < dc; ++i) {
-        if (!ReadLeU32(raw, at, deny[i])) return;
-    }
-    if (!ReadLeU32(raw, at, mc) || mc > 256) return;
     std::vector<YasvaraZygiskModuleCache> mods;
-    std::vector<std::string> libs;
-    mods.reserve(mc);
-    libs.reserve(mc);
-    for (uint32_t i = 0; i < mc; ++i) {
-        std::string id, mod_dir, lib64, lib32;
-        if (!ReadLeStr(raw, at, id, 128) || !ReadLeStr(raw, at, mod_dir, 1024) ||
-            !ReadLeStr(raw, at, lib64, 1024) || !ReadLeStr(raw, at, lib32, 1024)) {
-            return;
-        }
-        if (at >= raw.size()) return;
-        uint8_t scope_mode = raw[at++];
-        uint32_t sc = 0;
-        if (!ReadLeU32(raw, at, sc) || sc > 65536) return;
-        std::vector<uint32_t> suids(sc);
-        for (uint32_t j = 0; j < sc; ++j) {
-            if (!ReadLeU32(raw, at, suids[j])) return;
-        }
+    mods.reserve(set.modules.size());
+    for (auto& m : set.modules) {
         YasvaraZygiskModuleCache entry;
-        entry.has_abi = !lib64.empty();  // arm64-only: no zygote32
-        entry.scope_mode = scope_mode;
-        entry.scope_uids = std::move(suids);
-        libs.push_back(std::move(lib64));
+        entry.has_abi = !m.lib64.empty();  // arm64-only: no zygote32
+        entry.scope_mode = m.scope_mode;
+        entry.scope_uids = std::move(m.scope_uids);
         mods.push_back(std::move(entry));
     }
     // Copies only while Zygisk can load; unchanged modules keep their memfd.
-    const bool live = (flags & 1u) != 0 && (flags & 2u) == 0;
+    const bool live = (set.flags & yasvara::tabir::kZygiskEnabled) != 0 &&
+                      (set.flags & yasvara::tabir::kZygiskSafeBypass) == 0;
     std::vector<yasvara::tabir::SharedText> texts;
     if (live) {
-        texts.reserve(libs.size());
-        for (const auto& lib : libs) {
-            texts.push_back(yasvara::tabir::ReuseOrShare(lib, gZygiskSharedTexts));
+        texts.reserve(set.modules.size());
+        for (const auto& m : set.modules) {
+            texts.push_back(yasvara::tabir::ReuseOrShare(m.lib64, gZygiskSharedTexts));
         }
     }
     DropZygiskSharedTexts();
     gZygiskSharedTexts.swap(texts);
     for (const auto& t : gZygiskSharedTexts) gZygiskSharedFds.push_back(t.fd);
     gTabirZygiskRaw.swap(raw);
-    gTabirZygiskEnabled = (flags & 1u) != 0;
-    gTabirZygiskSafeBypass = (flags & 2u) != 0;
-    gTabirZygiskHasSystemServer = (flags & 4u) != 0;
-    gTabirZygiskDenylist.swap(deny);
+    gTabirZygiskEnabled = (set.flags & yasvara::tabir::kZygiskEnabled) != 0;
+    gTabirZygiskSafeBypass = (set.flags & yasvara::tabir::kZygiskSafeBypass) != 0;
+    gTabirZygiskHasSystemServer = (set.flags & yasvara::tabir::kZygiskHasSystemServer) != 0;
+    gTabirZygiskDenylist.swap(set.denylist);
     gTabirZygiskModules.swap(mods);
     gTabirZygiskMtime = st.st_mtim;
     gTabirZygiskSize = st.st_size;

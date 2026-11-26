@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -216,6 +217,79 @@ inline bool ShouldUnmount(uid_t uid, bool is_system_server, bool is_child_zygote
         should = default_unmount && !enrolled;
     }
     return should;
+}
+
+inline bool ReadLeU32(const std::vector<uint8_t>& buf, size_t& at, uint32_t& out) {
+    if (at > buf.size() || buf.size() - at < 4) return false;
+    memcpy(&out, buf.data() + at, 4);
+    at += 4;
+    return true;
+}
+
+inline bool ReadLeStr(const std::vector<uint8_t>& buf, size_t& at, std::string& out,
+                      size_t max_len) {
+    uint32_t len = 0;
+    if (!ReadLeU32(buf, at, len) || len > max_len || buf.size() - at < len) return false;
+    out.assign(reinterpret_cast<const char*>(buf.data() + at), len);
+    at += len;
+    return true;
+}
+
+// Reads `count` u32s, refusing a count the remaining bytes cannot hold before allocating.
+inline bool ReadLeU32s(const std::vector<uint8_t>& buf, size_t& at, uint32_t count,
+                       std::vector<uint32_t>& out) {
+    if ((buf.size() - at) / 4 < count) return false;
+    out.resize(count);
+    memcpy(out.data(), buf.data() + at, static_cast<size_t>(count) * 4);
+    at += static_cast<size_t>(count) * 4;
+    return true;
+}
+
+constexpr uint32_t kZygiskEnabled = 1u << 0;
+constexpr uint32_t kZygiskSafeBypass = 1u << 1;
+constexpr uint32_t kZygiskHasSystemServer = 1u << 2;
+
+struct ZygiskSetModule {
+    std::string lib64;
+    uint8_t scope_mode = 0;
+    std::vector<uint32_t> scope_uids;
+};
+
+struct ZygiskSet {
+    uint32_t flags = 0;
+    std::vector<uint32_t> denylist;
+    std::vector<ZygiskSetModule> modules;
+};
+
+// zygisk.set as yasvara_root_proto's ZygiskSet::encode writes it (the golden file in
+// vendor/yasvara/tests/zygote pins both). A short or unknown file is refused whole, so a torn
+// read never yields a partial table.
+inline bool ParseZygiskSet(const std::vector<uint8_t>& raw, ZygiskSet& out) {
+    if (raw.size() < 20 || memcmp(raw.data(), "AKZG", 4) != 0) return false;
+    size_t at = 4;
+    uint32_t ver = 0, dc = 0, mc = 0;
+    ZygiskSet set;
+    if (!ReadLeU32(raw, at, ver) || ver != 1 || !ReadLeU32(raw, at, set.flags) ||
+        !ReadLeU32(raw, at, dc) || dc > 65536 || !ReadLeU32s(raw, at, dc, set.denylist) ||
+        !ReadLeU32(raw, at, mc) || mc > 256) {
+        return false;
+    }
+    set.modules.resize(mc);
+    std::string unused;  // id, module dir and lib32 are the runtime's
+    for (auto& m : set.modules) {
+        uint32_t sc = 0;
+        if (!ReadLeStr(raw, at, unused, 128) || !ReadLeStr(raw, at, unused, 1024) ||
+            !ReadLeStr(raw, at, m.lib64, 1024) || !ReadLeStr(raw, at, unused, 1024) ||
+            at >= raw.size()) {
+            return false;
+        }
+        m.scope_mode = raw[at++];
+        if (!ReadLeU32(raw, at, sc) || sc > 65536 || !ReadLeU32s(raw, at, sc, m.scope_uids)) {
+            return false;
+        }
+    }
+    out = std::move(set);
+    return true;
 }
 
 }  // namespace tabir
