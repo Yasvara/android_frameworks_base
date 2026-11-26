@@ -37,6 +37,7 @@ import org.yasvara.kait.ipc.IRemotePreferenceCallback;
 import org.yasvara.kait.ipc.LoadedModule;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
@@ -96,6 +97,24 @@ final class KaitManagerService extends IYasvaraKait.Stub {
 
     KaitManagerService(Context context) {
         mContext = context;
+        syncHideSwitch();
+    }
+
+    private static final String HIDE_SWITCH = "/sys/kernel/yasvara_hide/kait";
+
+    /**
+     * The kernel hides Xposed module mappings from app /proc/self/maps only while a module
+     * is enabled; with none, those reads cost what stock costs.
+     */
+    private void syncHideSwitch() {
+        // Kernel without the switch: its filter is unconditional. EACCES also arrives as
+        // FileNotFoundException, so test for the file instead of swallowing that.
+        if (!new File(HIDE_SWITCH).exists()) return;
+        try (FileOutputStream out = new FileOutputStream(HIDE_SWITCH)) {
+            out.write(mConfig.anyEnabled() ? '1' : '0');
+        } catch (IOException e) {
+            Slog.w(TAG, HIDE_SWITCH + ": " + e.getMessage());
+        }
     }
 
     // ---- Injection Policy & Crash Circuit Breaker ----------------------------------------
@@ -518,6 +537,7 @@ final class KaitManagerService extends IYasvaraKait.Stub {
         final long token = Binder.clearCallingIdentity();
         try {
             mConfig.setEnabled(module, enabled);
+            syncHideSwitch();
             for (int userId : allUserIds()) {
                 for (String pkg : mConfig.getScope(module, userId)) {
                     resetCrashState(pkg, userId);

@@ -96,6 +96,15 @@ final class KaitConfig {
         }
     }
 
+    boolean anyEnabled() {
+        synchronized (mLock) {
+            for (int i = 0; i < mModules.size(); i++) {
+                if (mModules.valueAt(i).enabled) return true;
+            }
+        }
+        return false;
+    }
+
     void setEnabled(String module, boolean enabled) {
         synchronized (mLock) {
             Module m = mModules.get(module);
