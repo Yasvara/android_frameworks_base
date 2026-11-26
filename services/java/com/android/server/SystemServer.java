@@ -1866,6 +1866,18 @@ public final class SystemServer implements Dumpable {
             }
             t.traceEnd();
 
+            // Yasvara: Samar location override and privacy layers. Never fatal: without it
+            // every app sees the real location, as on stock.
+            t.traceBegin("StartYasvaraSamarService");
+            try {
+                ServiceManager.addService(
+                        com.android.server.yasvara.samar.SamarService.SERVICE_NAME,
+                        new com.android.server.yasvara.samar.SamarService(context));
+            } catch (Throwable e) {
+                Slog.e("SystemServer", "Failed to start SamarService", e);
+            }
+            t.traceEnd();
+
             // Yasvara: Tempel NFC card vault, profile switching, and tag engine. Never fatal:
             // without it NFC behaves identically to stock.
             t.traceBegin("StartYasvaraTempelService");

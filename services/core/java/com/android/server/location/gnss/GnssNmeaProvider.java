@@ -28,6 +28,7 @@ import android.util.Log;
 import com.android.internal.listeners.ListenerExecutor;
 import com.android.server.location.gnss.hal.GnssNative;
 import com.android.server.location.injector.AppOpsHelper;
+import com.android.server.yasvara.samar.SamarHooks;
 import com.android.server.location.injector.Injector;
 
 import java.util.Collection;
@@ -102,6 +103,9 @@ class GnssNmeaProvider extends GnssListenerMultiplexer<Void, IGnssNmeaListener, 
                     @Override
                     public ListenerExecutor.ListenerOperation<IGnssNmeaListener> apply(
                             GnssListenerRegistration registration) {
+                        if (SamarHooks.overrides(registration.getIdentity().getUid(), false)) {
+                            return null;
+                        }
                         if (mAppOpsHelper.noteOpNoThrow(AppOpsManager.OP_FINE_LOCATION,
                                 registration.getIdentity())) {
                             if (mNmea == null) {

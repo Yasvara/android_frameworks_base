@@ -38,6 +38,7 @@ import com.android.internal.annotations.GuardedBy;
 import com.android.server.location.gnss.GnssConfiguration.HalInterfaceVersion;
 import com.android.server.location.gnss.hal.GnssNative;
 import com.android.server.location.injector.AppOpsHelper;
+import com.android.server.yasvara.samar.SamarHooks;
 import com.android.server.location.injector.Injector;
 import com.android.server.location.injector.LocationUsageLogger;
 import com.android.server.location.injector.SettingsHelper;
@@ -262,6 +263,9 @@ public final class GnssMeasurementsProvider extends
     @Override
     public void onReportMeasurements(GnssMeasurementsEvent event) {
         deliverToListeners(registration -> {
+            if (SamarHooks.overrides(registration.getIdentity().getUid(), false)) {
+                return null;
+            }
             if (mAppOpsHelper.noteOpNoThrow(AppOpsManager.OP_FINE_LOCATION,
                     registration.getIdentity())) {
                 EVENT_LOG.logGnssMeasurementsDelivered(event.getMeasurements().size(),

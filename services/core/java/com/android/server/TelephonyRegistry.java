@@ -116,6 +116,7 @@ import com.android.internal.util.DumpUtils;
 import com.android.internal.util.FrameworkStatsLog;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.server.am.BatteryStatsService;
+import com.android.server.yasvara.samar.SamarHooks;
 
 import dalvik.annotation.optimization.NeverCompile;
 
@@ -4869,7 +4870,7 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
      * If you don't need app compat logic, use {@link #checkFineLocationAccess(Record)}.
      */
     private boolean checkFineLocationAccess(Record r, int minSdk) {
-        if (r.renounceFineLocationAccess) {
+        if (r.renounceFineLocationAccess || SamarHooks.hidesRadio(r.callerUid)) {
             return false;
         }
         LocationAccessPolicy.LocationPermissionQuery query =
@@ -4898,7 +4899,7 @@ public class TelephonyRegistry extends ITelephonyRegistry.Stub {
      * If you don't need app compat logic, use {@link #checkCoarseLocationAccess(Record)}.
      */
     private boolean checkCoarseLocationAccess(Record r, int minSdk) {
-        if (r.renounceCoarseLocationAccess) {
+        if (r.renounceCoarseLocationAccess || SamarHooks.hidesRadio(r.callerUid)) {
             return false;
         }
         LocationAccessPolicy.LocationPermissionQuery query =

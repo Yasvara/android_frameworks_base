@@ -188,6 +188,7 @@ import com.android.server.pm.PackageList;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.ProtectedPackages;
 import com.android.server.pm.UserManagerInternal;
+import com.android.server.yasvara.samar.SamarHooks;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.PackageState;
 import com.android.server.policy.AppOpsPolicy;
@@ -5407,6 +5408,9 @@ public class AppOpsService extends IAppOpsService.Stub {
     }
 
     private boolean isOpRestrictedDueToSuspend(int code, String packageName, int uid) {
+        if (SamarHooks.restrictsOp(code, uid)) {
+            return true;
+        }
         if (!ArrayUtils.contains(OPS_RESTRICTED_ON_SUSPEND, code)) {
             return false;
         }

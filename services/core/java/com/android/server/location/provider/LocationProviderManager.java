@@ -111,6 +111,7 @@ import com.android.server.location.injector.AppForegroundHelper;
 import com.android.server.location.injector.AppForegroundHelper.AppForegroundListener;
 import com.android.server.location.injector.AppOpsHelper;
 import com.android.server.location.injector.EmergencyHelper;
+import com.android.server.yasvara.samar.SamarHooks;
 import com.android.server.location.injector.Injector;
 import com.android.server.location.injector.LocationPermissionsHelper;
 import com.android.server.location.injector.LocationPermissionsHelper.LocationPermissionsListener;
@@ -907,8 +908,8 @@ public class LocationProviderManager extends
                 // requests are never delayed less than MIN_REQUEST_DELAY_MS, so it only makes sense
                 // to deliver historical locations to clients with a last location older than that
                 if (maxLocationAgeMs > MIN_REQUEST_DELAY_MS) {
-                    Location lastLocation = getLastLocationUnsafe(
-                            getIdentity().getUserId(),
+                    Location lastLocation = lastLocationFor(
+                            getIdentity(),
                             getPermissionLevel(),
                             getRequest().isBypass(),
                             maxLocationAgeMs);
@@ -1307,8 +1308,8 @@ public class LocationProviderManager extends
         protected void onActive() {
             super.onActive();
 
-            Location lastLocation = getLastLocationUnsafe(
-                    getIdentity().getUserId(),
+            Location lastLocation = lastLocationFor(
+                    getIdentity(),
                     getPermissionLevel(),
                     getRequest().isBypass(),
                     MAX_CURRENT_LOCATION_AGE_MS);
@@ -1585,6 +1586,7 @@ public class LocationProviderManager extends
         mLocationUsageLogger = injector.getLocationUsageLogger();
         mLocationFudger = new LocationFudger(mSettingsHelper.getCoarseLocationAccuracyM());
         mEmergencyHelper = injector.getEmergencyHelper();
+        SamarHooks.addListener(mSamarListener);
         mPackageResetHelper = injector.getPackageResetHelper();
 
         mProvider = new MockableLocationProvider(mMultiplexerLock);
@@ -1833,8 +1835,8 @@ public class LocationProviderManager extends
         }
 
         Location location = getPermittedLocation(
-                getLastLocationUnsafe(
-                        identity.getUserId(),
+                lastLocationFor(
+                        identity,
                         permissionLevel,
                         request.isBypass(),
                         Long.MAX_VALUE),
@@ -2409,6 +2411,7 @@ public class LocationProviderManager extends
         boolean adasGnssBypass = false;
         boolean locationSettingsIgnored = false;
         boolean lowPower = true;
+        final boolean emergency = mEmergencyHelper.isInEmergency(0);
 
         for (Registration registration : registrations) {
             LocationRequest request = registration.getRequest();
@@ -2416,6 +2419,11 @@ public class LocationProviderManager extends
             // passive requests do not contribute to the provider request, and passive requests
             // must handle the batching parameters of non-passive requests
             if (request.getIntervalMillis() == LocationRequest.PASSIVE_INTERVAL) {
+                continue;
+            }
+
+            // clients on a simulated location do not turn on the hardware
+            if (SamarHooks.overrides(registration.getIdentity().getUid(), emergency)) {
                 continue;
             }
 
@@ -2684,8 +2692,12 @@ public class LocationProviderManager extends
         // update last location
         setLastLocation(processed.getLastLocation(), UserHandle.USER_ALL);
 
-        // attempt listener delivery
+        // attempt listener delivery; clients on a simulated location get it from onSamarTick
+        final boolean emergency = mEmergencyHelper.isInEmergency(0);
         deliverToListeners(registration -> {
+            if (SamarHooks.overrides(registration.getIdentity().getUid(), emergency)) {
+                return null;
+            }
             return registration.acceptLocationChange(processed);
         });
 
@@ -2848,6 +2860,46 @@ public class LocationProviderManager extends
         // update active state of affected registrations
         updateRegistrations(registration -> registration.getIdentity().getUserId() == userId);
     }
+
+    /** The simulated fix for an overridden client, otherwise the cached real one. */
+    @Nullable
+    private Location lastLocationFor(CallerIdentity identity, @PermissionLevel int permissionLevel,
+            boolean isBypass, long maximumAgeMs) {
+        Location simulated = SamarHooks.location(identity.getUid(),
+                mEmergencyHelper.isInEmergency(0), mName);
+        if (simulated != null) {
+            return simulated;
+        }
+        return getLastLocationUnsafe(identity.getUserId(), permissionLevel, isBypass,
+                maximumAgeMs);
+    }
+
+    private final SamarHooks.Listener mSamarListener = new SamarHooks.Listener() {
+        @Override
+        public void onSamarTick() {
+            synchronized (mMultiplexerLock) {
+                if (mState != STATE_STARTED) {
+                    return;
+                }
+                final boolean emergency = mEmergencyHelper.isInEmergency(0);
+                deliverToListeners(registration -> {
+                    Location simulated = SamarHooks.location(
+                            registration.getIdentity().getUid(), emergency, mName);
+                    return simulated == null ? null
+                            : registration.acceptLocationChange(LocationResult.wrap(simulated));
+                });
+            }
+        }
+
+        @Override
+        public void onSamarChanged() {
+            synchronized (mMultiplexerLock) {
+                if (mState == STATE_STARTED) {
+                    updateService();
+                }
+            }
+        }
+    };
 
     @Nullable Location getPermittedLocation(@Nullable Location fineLocation,
             @PermissionLevel int permissionLevel) {

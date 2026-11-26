@@ -29,23 +29,33 @@ import android.util.Log;
 
 import com.android.server.location.gnss.hal.GnssNative;
 import com.android.server.location.injector.AppOpsHelper;
+import com.android.server.yasvara.samar.SamarHooks;
+
 import com.android.server.location.injector.Injector;
 import com.android.server.location.injector.LocationUsageLogger;
 
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 /**
  * GNSS status HAL module and listener multiplexer.
  */
 public class GnssStatusProvider extends
         GnssListenerMultiplexer<Void, IGnssStatusListener, Void> implements
-        GnssNative.BaseCallbacks, GnssNative.StatusCallbacks, GnssNative.SvStatusCallbacks {
+        GnssNative.BaseCallbacks, GnssNative.StatusCallbacks, GnssNative.SvStatusCallbacks,
+        SamarHooks.Listener {
 
     private final AppOpsHelper mAppOpsHelper;
     private final LocationUsageLogger mLogger;
     private final GnssNative mGnssNative;
 
     private boolean mIsNavigating = false;
+
+    /** Overridden clients already told the simulated engine started. */
+    private final Set<GnssListenerRegistration> mSimulated =
+            Collections.newSetFromMap(new WeakHashMap<>());
 
     public GnssStatusProvider(Injector injector, GnssNative gnssNative) {
         super(injector);
@@ -56,6 +66,7 @@ public class GnssStatusProvider extends
         gnssNative.addBaseCallbacks(this);
         gnssNative.addStatusCallbacks(this);
         gnssNative.addSvStatusCallbacks(this);
+        SamarHooks.addListener(this);
     }
 
     @Override
@@ -140,24 +151,32 @@ public class GnssStatusProvider extends
 
         if (isNavigating != mIsNavigating) {
             mIsNavigating = isNavigating;
-            if (isNavigating) {
-                deliverToListeners(IGnssStatusListener::onGnssStarted);
-            } else {
-                deliverToListeners(IGnssStatusListener::onGnssStopped);
-            }
+            deliverToListeners(registration -> {
+                if (SamarHooks.overrides(registration.getIdentity().getUid(), false)) {
+                    return null;
+                }
+                return isNavigating ? IGnssStatusListener::onGnssStarted
+                        : IGnssStatusListener::onGnssStopped;
+            });
         }
     }
 
     @Override
     public void onReportFirstFix(int ttff) {
-        deliverToListeners(listener -> {
-            listener.onFirstFix(ttff);
+        deliverToListeners(registration -> {
+            if (SamarHooks.overrides(registration.getIdentity().getUid(), false)) {
+                return null;
+            }
+            return listener -> listener.onFirstFix(ttff);
         });
     }
 
     @Override
     public void onReportSvStatus(GnssStatus gnssStatus) {
         deliverToListeners(registration -> {
+            if (SamarHooks.overrides(registration.getIdentity().getUid(), false)) {
+                return null;
+            }
             if (mAppOpsHelper.noteOpNoThrow(AppOpsManager.OP_FINE_LOCATION,
                     registration.getIdentity())) {
                 return listener -> listener.onSvStatusChanged(gnssStatus);
@@ -166,4 +185,29 @@ public class GnssStatusProvider extends
             }
         });
     }
+
+    @Override
+    public void onSamarTick() {
+        deliverToListeners(registration -> {
+            GnssStatus simulated = SamarHooks.gnssStatus(registration.getIdentity().getUid());
+            if (simulated == null) {
+                mSimulated.remove(registration);
+                return null;
+            }
+            if (!mAppOpsHelper.noteOpNoThrow(AppOpsManager.OP_FINE_LOCATION,
+                    registration.getIdentity())) {
+                return null;
+            }
+            final boolean started = mSimulated.add(registration);
+            return listener -> {
+                if (started) {
+                    listener.onGnssStarted();
+                }
+                listener.onSvStatusChanged(simulated);
+            };
+        });
+    }
+
+    @Override
+    public void onSamarChanged() {}
 }

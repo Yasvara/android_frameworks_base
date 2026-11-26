@@ -123,6 +123,18 @@ filegroup {
 }
 
 filegroup {
+    name: "yasvara-samar-aidl",
+    srcs: ["java/com/android/server/yasvara/samar/IYasvaraSamar.aidl"],
+    path: "java",
+    // Soong lets packages outside //vendor name only the whole of it.
+    visibility: [
+        "//packages/apps/Laras",
+        "//packages/services/Telephony",
+        "//vendor:__subpackages__",
+    ],
+}
+
+filegroup {
     name: "yasvara-tempel-aidl",
     srcs: ["java/com/android/server/yasvara/tempel/IYasvaraTempel.aidl"],
     path: "java",
@@ -135,6 +147,7 @@ filegroup {
 filegroup {
     name: "services.core-aidl-sources",
     srcs: [
+        ":yasvara-samar-aidl",
         ":yasvara-tempel-aidl",
         ":yasvara-root-aidl",
         ":yasvara-ketik-aidl",
