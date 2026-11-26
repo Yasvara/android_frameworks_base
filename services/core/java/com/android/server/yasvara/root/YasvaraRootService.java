@@ -743,7 +743,7 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
                     }
                 }
             }
-            boolean defaultUnmount = true;
+            boolean defaultUnmount = false;
             org.json.JSONArray forceUnmount = new org.json.JSONArray();
             org.json.JSONArray exemptUnmount = new org.json.JSONArray();
             if (UNMOUNT_CONF_FILE.isFile()) {
@@ -803,7 +803,7 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
             writeAtomicConf(ZYGISK_CONF_FILE, zsb.toString());
 
             StringBuilder usb = new StringBuilder("# yasvara-unmount v1\n");
-            usb.append("default_unmount=").append(jo.optBoolean("defaultUnmount", true) ? 1 : 0).append('\n');
+            usb.append("default_unmount=").append(jo.optBoolean("defaultUnmount", false) ? 1 : 0).append('\n');
             usb.append("force=").append(joinIntArray(jo.optJSONArray("forceUnmount"))).append('\n');
             usb.append("exempt=").append(joinIntArray(jo.optJSONArray("exemptUnmount"))).append('\n');
             writeAtomicConf(UNMOUNT_CONF_FILE, usb.toString());
