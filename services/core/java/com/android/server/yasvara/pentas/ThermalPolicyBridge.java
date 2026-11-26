@@ -210,6 +210,10 @@ final class ThermalPolicyBridge {
         mMaxWatt = detectMaxWatt();
         mChargeMaxWatt = mMaxWatt;
         mOriginalSconfig = readIntNode(NODE_SCONFIG, 0);
+        if ("1".equals(readNode(NODE_SCHED_BOOST))) {
+            writeNodeIfExists(NODE_SCHED_BOOST, "0");
+            Slog.w(TAG, "Cleared stale sched_boost=1");
+        }
 
         final ContentResolver cr = mContext.getContentResolver();
         final boolean lowPower = Settings.Global.getInt(cr, Settings.Global.LOW_POWER_MODE, 0) == 1;
@@ -522,9 +526,9 @@ final class ThermalPolicyBridge {
     private void applyGameBoost(boolean enable) {
         if (enable == mGameBoostActive) return;
         mGameBoostActive = enable;
-        final String v = enable ? "1" : "0";
-        writeNodeIfExists(NODE_SCHED_BOOST, v);
-        writeNodeIfExists(NODE_THERMAL_BOOST, v);
+        // No WALT sched_boost here: full throttle for a whole session packs every task on the
+        // prime/gold clusters with EAS off, +47% power at equal work on onyx.
+        writeNodeIfExists(NODE_THERMAL_BOOST, enable ? "1" : "0");
     }
 
     private static boolean isGamingSconfig(int sconfig) {
