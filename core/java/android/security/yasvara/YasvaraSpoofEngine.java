@@ -19,6 +19,7 @@ import android.os.Build;
 import android.os.Parcel;
 import android.os.Process;
 import android.os.SystemProperties;
+import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.Settings;
 import android.system.Os;
@@ -67,6 +68,7 @@ public final class YasvaraSpoofEngine {
     static final String KEY_PHOTOS_SPOOF = "yasvara_photos_spoof";
     static final String KEY_SNAP_SPOOF = "yasvara_snap_spoof";
     static final String KEY_KEYBOX_STAMP = "yasvara_keybox_stamp";
+    static final String KEY_RKP_MANUFACTURER = "yasvara_rkp_manufacturer";
     static final String KEY_PATCH_OVERRIDE = "yasvara_trickystore_patch_override";
     private static final String DG_STAMP_FILE = ".yasvara_dg_stamp";
 
@@ -82,6 +84,7 @@ public final class YasvaraSpoofEngine {
     private static final String PKG_PHOTOS = "com.google.android.apps.photos";
     private static final String PKG_SNAPCHAT = "com.snapchat.android";
     private static final String PKG_SI = "com.google.android.settings.intelligence";
+    private static final String PKG_RKPD = "com.android.rkpdapp";
 
     private static final String[] CAMERA_EXEMPT_PREFIX = {
         "com.android.camera",
@@ -131,6 +134,9 @@ public final class YasvaraSpoofEngine {
     /** Optional PIF board/vendor YYYYMM API level (never inferred from DEVICE_INITIAL_SDK_INT). */
     private static volatile String sSpoofedApiLevel;
 
+    /** RKP ProvisioningInfo manufacturer (CBOR key 3) applied to non-collector app processes. */
+    private static volatile String sRkpManufacturer;
+
     /**
      * The device's real Android release ("17"), captured at class init. Class init always
      * precedes {@link #apply}, so this is read before {@link #setProp} can overwrite
@@ -169,6 +175,7 @@ public final class YasvaraSpoofEngine {
             final boolean isGsf = PKG_GSF.equals(packageName);
             final boolean isVending = PKG_VENDING.equals(packageName);
             sPropSpoofGate = 2;
+            sRkpManufacturer = null;
 
             final int mode = getInt(context, KEY_SPOOF_MODE, MODE_AUTO);
             final boolean forceFull = mode == MODE_FULL;
@@ -231,6 +238,21 @@ public final class YasvaraSpoofEngine {
             if (PKG_SI.equals(packageName)) {
                 setProp("FINGERPRINT", String.valueOf(Build.TIME));
             }
+
+            // 5. Align Build.MANUFACTURER / MANUFACTURER_FOR_ATTESTATION and ro.product.*
+            // manufacturer props with the installed RKP keybox's ProvisioningInfo map[3] for
+            // non-collector app processes while TrickyStore is enabled.
+            if (UserHandle.getAppId(Process.myUid()) >= Process.FIRST_APPLICATION_UID
+                    && !PKG_RKPD.equals(packageName)
+                    && !YasvaraUpdatePolicy.LARAS_PACKAGE.equals(packageName)
+                    && YasvaraTrickyStore.isEnabled(context)) {
+                String rkpMfg = getRkpManufacturer(context);
+                if (!TextUtils.isEmpty(rkpMfg)) {
+                    setProp("MANUFACTURER", rkpMfg);
+                    setProp("MANUFACTURER_FOR_ATTESTATION", rkpMfg);
+                    sRkpManufacturer = rkpMfg;
+                }
+            }
         } catch (Throwable t) {
             Log.w(TAG, "apply failed", t);
         }
@@ -272,8 +294,14 @@ public final class YasvaraSpoofEngine {
 
     public static String mapProp(String key) {
         try {
-            // Fast-path: 1 volatile read for non-collector processes; 3-char prefix check for non-ro props.
-            if (sPropSpoofGate != 1 || key == null || !key.startsWith("ro.")) return null;
+            if (key == null || !key.startsWith("ro.")) return null;
+            if (sPropSpoofGate != 1) {
+                String rkpMfg = sRkpManufacturer;
+                if (rkpMfg != null && isProductManufacturerProp(key)) {
+                    return rkpMfg;
+                }
+                return null;
+            }
             if (key.startsWith("ro.product.") && !key.startsWith("ro.product.build.")) {
                 if (key.endsWith(".brand")) return Build.BRAND;
                 if (key.endsWith(".model")) return Build.MODEL;
@@ -311,6 +339,22 @@ public final class YasvaraSpoofEngine {
             }
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    private static boolean isProductManufacturerProp(String key) {
+        return "ro.product.manufacturer_for_attestation".equals(key)
+                || (key.startsWith("ro.product.") && key.endsWith(".manufacturer"));
+    }
+
+    /** Returns the active RKP keybox ProvisioningInfo manufacturer (CBOR key 3), or "". */
+    public static String getRkpManufacturer(Context ctx) {
+        if (ctx == null) return "";
+        try {
+            String raw = Settings.Secure.getString(ctx.getContentResolver(), KEY_RKP_MANUFACTURER);
+            return raw != null ? raw.trim() : "";
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 

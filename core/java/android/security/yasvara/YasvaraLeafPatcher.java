@@ -159,8 +159,7 @@ public final class YasvaraLeafPatcher {
             // Keep all TEE tags except patch levels, identity tags, and RootOfTrust (replaced).
             ASN1EncodableVector kept = new ASN1EncodableVector();
             java.util.Map<Integer, ASN1TaggedObject> replacedIds = new java.util.HashMap<>();
-            final boolean stripHwUniqueIds =
-                    req.attestIdOverrides != null && !req.attestIdOverrides.isEmpty();
+            final boolean stripHwUniqueIds = hasNonManufacturerIdOverrides(req.attestIdOverrides);
             for (ASN1Encodable e : originalRecord.teeEnforced) {
                 if (!(e instanceof ASN1TaggedObject)) continue;
                 int tag = ((ASN1TaggedObject) e).getTagNo();
@@ -245,6 +244,17 @@ public final class YasvaraLeafPatcher {
             Log.w(TAG, "patch failed", t);
             return null;
         }
+    }
+
+    private static boolean hasNonManufacturerIdOverrides(
+            java.util.Map<Integer, String> overrides) {
+        if (overrides == null || overrides.isEmpty()) return false;
+        for (int tag : new int[] {
+                TAG_ATTEST_BRAND, TAG_ATTEST_DEVICE, TAG_ATTEST_PRODUCT, TAG_ATTEST_MODEL}) {
+            String v = overrides.get(tag);
+            if (v != null && !v.isEmpty()) return true;
+        }
+        return false;
     }
 
     /** Override story wins; otherwise this process' live Build value. */

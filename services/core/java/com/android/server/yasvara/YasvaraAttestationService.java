@@ -76,6 +76,11 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
     private static final String PATCH_OVERRIDE_KEY = "yasvara_trickystore_patch_override";
     /** Keybox change stamp observed by DroidGuard cache invalidation. */
     private static final String KEYBOX_STAMP_KEY = "yasvara_keybox_stamp";
+    /** RKP ProvisioningInfo manufacturer (CBOR key 3) extracted from the active keybox. */
+    private static final String RKP_MANUFACTURER_KEY = "yasvara_rkp_manufacturer";
+    /** Native property mirroring RKP manufacturer for Bionic libc and early readers. */
+    private static final String NATIVE_RKP_MANUFACTURER_PROPERTY =
+            "persist.sys.yasvara.rkp_manufacturer";
     /** Rung telemetry key in Settings.Secure. */
     private static final String RUNG_KEY = "yasvara_trickystore_rung";
 
@@ -189,10 +194,13 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             for (String pkg : YasvaraTrickyStore.effectiveTargets(mContext)) {
                 targets.append(pkg).append('\n');
             }
+            List<YasvaraKeyboxProvider.Keybox> keyboxes;
             synchronized (mLock) {
                 mKeyboxStore.publishConfig("targets", targets.toString());
                 mKeyboxStore.publishConfig("patch_override", trimmedOverride);
+                keyboxes = new ArrayList<>(mKeyboxes);
             }
+            updateRkpManufacturer(keyboxes, true);
         } catch (Throwable t) {
             Slog.w(TAG, "syncControl failed; keystore2 keeps its previous target list", t);
         }
@@ -392,6 +400,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
                 }
                 o.put("algorithms", algos);
                 o.put("keyCount", mKeyboxes.size());
+                o.put("rkpManufacturer", YasvaraKeyboxProvider.rkpManufacturer(mKeyboxes));
                 return o.toString();
             }
         } catch (Throwable t) {
@@ -414,6 +423,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             }
         }
         updateKeyboxStamp(keyboxes);
+        updateRkpManufacturer(keyboxes, true);
         restartIntegrityProcesses(true);
     }
 
@@ -430,7 +440,32 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             }
         }
         updateKeyboxStamp(null);
+        updateRkpManufacturer(null, true);
         restartIntegrityProcesses(true);
+    }
+
+    private void updateRkpManufacturer(
+            List<YasvaraKeyboxProvider.Keybox> keyboxes, boolean writeSettings) {
+        String mfg = YasvaraKeyboxProvider.rkpManufacturer(keyboxes);
+        try {
+            SystemProperties.set(NATIVE_RKP_MANUFACTURER_PROPERTY, mfg);
+        } catch (Throwable t) {
+            Slog.w(TAG, "set " + NATIVE_RKP_MANUFACTURER_PROPERTY + " failed", t);
+        }
+        if (!writeSettings) return;
+        final long token = Binder.clearCallingIdentity();
+        try {
+            String current = Settings.Secure.getString(
+                    mContext.getContentResolver(), RKP_MANUFACTURER_KEY);
+            if (!mfg.equals(current != null ? current : "")) {
+                Settings.Secure.putString(
+                        mContext.getContentResolver(), RKP_MANUFACTURER_KEY, mfg);
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "updateRkpManufacturer failed", t);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private void updateKeyboxStamp(List<YasvaraKeyboxProvider.Keybox> keyboxes) {
@@ -638,14 +673,19 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
     }
 
     private void loadFromFile() {
+        List<YasvaraKeyboxProvider.Keybox> loaded = null;
         synchronized (mLock) {
             try {
                 mKeyboxStore.load(YasvaraAttestationService::parseKeyboxes,
                         keyboxes -> mKeyboxes = keyboxes != null ? keyboxes : new ArrayList<>());
+                loaded = new ArrayList<>(mKeyboxes);
             } catch (IOException | IllegalArgumentException e) {
                 // A failed migration must not fall back to a Java-only legacy credential.
                 Slog.e(TAG, "loadFromFile failed; check canonical directory setup and keybox", e);
             }
+        }
+        if (loaded != null) {
+            updateRkpManufacturer(loaded, false);
         }
     }
 

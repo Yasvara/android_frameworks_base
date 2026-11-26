@@ -8,10 +8,13 @@ import android.text.TextUtils;
 import android.util.Base64;
 import android.util.Log;
 
+import com.android.internal.org.bouncycastle.asn1.ASN1OctetString;
+import com.android.internal.org.bouncycastle.asn1.ASN1Primitive;
 import com.android.internal.org.bouncycastle.asn1.x500.X500Name;
 import com.android.internal.org.bouncycastle.cert.X509CertificateHolder;
 
 import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
@@ -61,20 +64,29 @@ public final class YasvaraKeyboxProvider {
     public static final int ERROR_CHAIN_TOO_SHORT = 5;
     public static final int ERROR_INVALID_KEYBOX = 6;
 
+    /** RKP ProvisioningInfo extension OID carrying CBOR map with key 3 = manufacturer. */
+    public static final String PROVISIONING_INFO_OID = "1.3.6.1.4.1.11129.2.1.30";
+
+    private static final int MAX_PROVISIONING_BYTES = 64 * 1024;
+    private static final int MAX_CBOR_DEPTH = 32;
+    private static final int MAX_PROP_VALUE_BYTES = 91;
+
     /**
-     * One {@code <Key>}: its algorithm ("ecdsa" or "rsa"), certificate chain (leaf first) and the
-     * PEM of its private key, which is null when the keybox was stripped of it.
+     * One {@code <Key>}: its algorithm ("ecdsa" or "rsa"), certificate chain (leaf first), the
+     * PEM of its private key (null when stripped), and the RKP provisioning manufacturer if any.
      */
     public static final class Keybox {
         public final String algorithm;
         public final List<X509Certificate> chain;
         public final String privateKeyPem;
+        public final String rkpManufacturer;
         private volatile X500Name mIssuerName;
 
         Keybox(String algorithm, List<X509Certificate> chain, String privateKeyPem) {
             this.algorithm = algorithm;
             this.chain = Collections.unmodifiableList(chain);
             this.privateKeyPem = privateKeyPem;
+            this.rkpManufacturer = extractRkpManufacturer(this.chain);
         }
 
         public boolean hasPrivateKey() {
@@ -265,5 +277,164 @@ public final class YasvaraKeyboxProvider {
         if (verifier.verify(signature)) return;
         throw new java.security.InvalidKeyException(
                 "private key does not correspond to keybox certificate");
+    }
+
+    /**
+     * Returns the RKP ProvisioningInfo manufacturer (CBOR key 3) across parsed keyboxes,
+     * preferring the ECDSA entry since RKP provisioning uses EC keys. Returns {@code ""}.
+     */
+    public static String rkpManufacturer(List<Keybox> keyboxes) {
+        if (keyboxes == null || keyboxes.isEmpty()) return "";
+        String fallback = null;
+        for (Keybox kb : keyboxes) {
+            if (kb == null || TextUtils.isEmpty(kb.rkpManufacturer)) continue;
+            if ("ecdsa".equalsIgnoreCase(kb.algorithm)) return kb.rkpManufacturer;
+            if (fallback == null) fallback = kb.rkpManufacturer;
+        }
+        return fallback != null ? fallback : "";
+    }
+
+    /** Extracts CBOR map key 3 from OID 1.3.6.1.4.1.11129.2.1.30 on the keybox chain. */
+    public static String extractRkpManufacturer(List<X509Certificate> chain) {
+        if (chain == null || chain.isEmpty()) return null;
+        for (X509Certificate cert : chain) {
+            if (cert == null) continue;
+            try {
+                byte[] extBytes = cert.getExtensionValue(PROVISIONING_INFO_OID);
+                if (extBytes == null || extBytes.length > MAX_PROVISIONING_BYTES) continue;
+                ASN1OctetString octets = ASN1OctetString.getInstance(
+                        ASN1Primitive.fromByteArray(extBytes));
+                if (octets == null) continue;
+                String mfg = parseProvisioningManufacturer(octets.getOctets());
+                if (mfg != null) return mfg;
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    /** Parses top-level CBOR map key 3 (UTF-8 text string) from ProvisioningInfo payload. */
+    static String parseProvisioningManufacturer(byte[] cbor) {
+        if (cbor == null || cbor.length == 0 || cbor.length > MAX_PROVISIONING_BYTES) return null;
+        CborReader reader = new CborReader(cbor);
+        long mapLen = reader.readHeader(5);
+        if (mapLen < 0) return null;
+        for (long i = 0; i < mapLen; i++) {
+            int keyMajor = reader.peekMajorType();
+            if (keyMajor < 0) return null;
+            if (keyMajor == 0) {
+                long key = reader.readHeader(0);
+                if (key < 0) return null;
+                if (key == 3L) {
+                    if (reader.peekMajorType() != 3) return null;
+                    long textLen = reader.readHeader(3);
+                    if (textLen < 0 || textLen > reader.remaining()) return null;
+                    String raw = reader.readUtf8((int) textLen);
+                    String trimmed = raw != null ? raw.trim() : "";
+                    if (trimmed.isEmpty()
+                            || trimmed.getBytes(StandardCharsets.UTF_8).length > MAX_PROP_VALUE_BYTES) {
+                        return null;
+                    }
+                    return trimmed;
+                }
+            } else if (!reader.skipItem(0)) {
+                return null;
+            }
+            if (!reader.skipItem(0)) return null;
+        }
+        return null;
+    }
+
+    private static final class CborReader {
+        private final byte[] buf;
+        private int pos;
+
+        CborReader(byte[] buf) {
+            this.buf = buf;
+        }
+
+        int remaining() {
+            return buf.length - pos;
+        }
+
+        int peekMajorType() {
+            return pos < buf.length ? ((buf[pos] & 0xFF) >>> 5) : -1;
+        }
+
+        long readHeader(int expectedMajor) {
+            if (pos >= buf.length) return -1;
+            int initial = buf[pos++] & 0xFF;
+            if ((initial >>> 5) != expectedMajor) return -1;
+            return readArg(initial & 0x1F);
+        }
+
+        private long readArg(int ai) {
+            if (ai < 24) return ai;
+            int extraBytes = switch (ai) {
+                case 24 -> 1;
+                case 25 -> 2;
+                case 26 -> 4;
+                case 27 -> 8;
+                default -> -1; // Indefinite-length (31) and reserved (28..30) rejected.
+            };
+            if (extraBytes < 0 || extraBytes > remaining()) return -1;
+            long val = 0;
+            for (int i = 0; i < extraBytes; i++) {
+                val = (val << 8) | (buf[pos++] & 0xFFL);
+            }
+            return val < 0 ? -1 : val;
+        }
+
+        String readUtf8(int len) {
+            if (len < 0 || len > remaining()) return null;
+            String s = new String(buf, pos, len, StandardCharsets.UTF_8);
+            pos += len;
+            return s;
+        }
+
+        boolean skipItem(int depth) {
+            if (depth > MAX_CBOR_DEPTH || pos >= buf.length) return false;
+            int initial = buf[pos++] & 0xFF;
+            int major = initial >>> 5;
+            int ai = initial & 0x1F;
+            if (major == 7) {
+                int skip = switch (ai) {
+                    case 24 -> 1;
+                    case 25 -> 2;
+                    case 26 -> 4;
+                    case 27 -> 8;
+                    default -> (ai < 24) ? 0 : -1;
+                };
+                if (skip < 0 || skip > remaining()) return false;
+                pos += skip;
+                return true;
+            }
+            long arg = readArg(ai);
+            if (arg < 0) return false;
+            switch (major) {
+                case 0:
+                case 1:
+                    return true;
+                case 2:
+                case 3:
+                    if (arg > remaining()) return false;
+                    pos += (int) arg;
+                    return true;
+                case 4:
+                    for (long i = 0; i < arg; i++) {
+                        if (!skipItem(depth + 1)) return false;
+                    }
+                    return true;
+                case 5:
+                    for (long i = 0; i < arg; i++) {
+                        if (!skipItem(depth + 1) || !skipItem(depth + 1)) return false;
+                    }
+                    return true;
+                case 6:
+                    return skipItem(depth + 1);
+                default:
+                    return false;
+            }
+        }
     }
 }

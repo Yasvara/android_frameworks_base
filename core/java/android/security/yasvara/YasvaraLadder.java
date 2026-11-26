@@ -162,18 +162,32 @@ public final class YasvaraLadder {
                 ? YasvaraIdentity.resolveBootKey(bootHash) : null;
         // Attestation-ID story for the patched leaf (PIF profile for GMS/Play
         // Store when PIF is enabled; live-Build fallback for everyone else).
-        req.attestIdOverrides = attestIdsFor(ctx, pkg);
+        req.attestIdOverrides = attestIdsFor(ctx, pkg, selected);
         return YasvaraLeafPatcher.patch(req);
     }
 
     /**
      * Attestation-ID story for the patched leaf. GMS / Play Store get the PIF
      * profile when PIF is enabled (their Build is PIF-spoofed, so the leaf must agree);
-     * every other target resolves via the live-Build fallback in the patcher.
+     * non-collector targets align ATTESTATION_ID_MANUFACTURER with the RKP keybox when
+     * present, and otherwise fall back to live Build fields in the patcher.
      */
     static java.util.Map<Integer, String> attestIdsFor(Context ctx, String pkg) {
+        return attestIdsFor(ctx, pkg, null);
+    }
+
+    static java.util.Map<Integer, String> attestIdsFor(
+            Context ctx, String pkg, YasvaraKeyboxProvider.Keybox selected) {
         try {
-            if (!YasvaraSpoofEngine.isCollectorPackage(pkg)) return null;
+            if (!YasvaraSpoofEngine.isCollectorPackage(pkg)) {
+                String rkpMfg = (selected != null && !TextUtils.isEmpty(selected.rkpManufacturer))
+                        ? selected.rkpManufacturer
+                        : YasvaraSpoofEngine.getRkpManufacturer(ctx);
+                if (!TextUtils.isEmpty(rkpMfg)) {
+                    return java.util.Collections.singletonMap(716, rkpMfg);
+                }
+                return null;
+            }
             if (!YasvaraSpoofEngine.isPifEnabled(ctx)) {
                 return null;
             }
