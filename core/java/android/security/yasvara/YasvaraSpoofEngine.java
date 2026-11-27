@@ -31,9 +31,12 @@ import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.FileWriter;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
+import java.nio.channels.FileLock;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -71,6 +74,7 @@ public final class YasvaraSpoofEngine {
     static final String KEY_RKP_MANUFACTURER = YasvaraIntegrityContract.SECURE_RKP_MANUFACTURER;
     static final String KEY_PATCH_OVERRIDE = YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE;
     private static final String DG_STAMP_FILE = ".yasvara_dg_stamp";
+    private static final String DG_STAMP_LOCK_FILE = ".yasvara_dg_stamp.lock";
 
     /** 0 = auto, 1 = full fingerprint, 2 = model-only (Widevine-safe). */
     static final int MODE_AUTO = 0;
@@ -211,9 +215,9 @@ public final class YasvaraSpoofEngine {
                 final boolean pifEnabled = isPifEnabled(context);
                 final Map<String, String> pif = pifEnabled ? getPifConfig(context) : null;
 
-                // In-process auto-purge in DroidGuard (.unstable) or main GMS/Vending process.
-                if (isGmsUnstable || (isVending && isMainPackageProcess)
-                        || (isGms && isMainPackageProcess)) {
+                // In-process auto-purge in DroidGuard (.unstable), main GMS, or any Play Store process
+                // so a background Vending process cannot open stale valuestores before purge runs.
+                if (isGmsUnstable || isVending || (isGms && isMainPackageProcess)) {
                     maybePurgeDroidGuard(context, pifEnabled, pif);
                 }
 
@@ -527,37 +531,64 @@ public final class YasvaraSpoofEngine {
             if (dataDir == null) return;
             File stampFile = new File(dataDir, DG_STAMP_FILE);
 
-            if (stampFile.exists()) {
-                try (BufferedReader r = new BufferedReader(new FileReader(stampFile))) {
-                    String savedStamp = r.readLine();
-                    if (currentStamp.equals(savedStamp != null ? savedStamp.trim() : "")) {
-                        return; // State unchanged, dg.db cache is valid.
-                    }
-                } catch (Throwable ignored) {
+            // Fast path (steady state): single 8-byte read, zero locks, zero writes.
+            if (currentStamp.equals(readStamp(stampFile))) {
+                return;
+            }
+
+            // Slow path (state changed): serialize concurrent sibling starts (e.g. GMS main +
+            // .unstable, or Vending main + :background) and update stamp atomically.
+            File lockFile = new File(dataDir, DG_STAMP_LOCK_FILE);
+            try (RandomAccessFile raf = new RandomAccessFile(lockFile, "rw");
+                 FileLock ignoredLock = raf.getChannel().lock()) {
+                if (currentStamp.equals(readStamp(stampFile))) {
+                    return;
                 }
-            }
 
-            // State changed: delete DroidGuard & GMS/Play Integrity verdict caches.
-            context.deleteDatabase("dg.db");
-            context.deleteDatabase("gmscompliance.db");
-            Context deCtx = context.createDeviceProtectedStorageContext();
-            if (deCtx != null) {
-                deCtx.deleteDatabase("dg.db");
-                deCtx.deleteDatabase("gmscompliance.db");
-            }
+                // State changed: delete DroidGuard & GMS/Play Integrity verdict caches.
+                context.deleteDatabase("dg.db");
+                context.deleteDatabase("gmscompliance.db");
+                Context deCtx = context.createDeviceProtectedStorageContext();
+                if (deCtx != null) {
+                    deCtx.deleteDatabase("dg.db");
+                    deCtx.deleteDatabase("gmscompliance.db");
+                }
 
-            purgeIntegrityDirs(dataDir);
-            if (deCtx != null && deCtx.getDataDir() != null) {
-                purgeIntegrityDirs(deCtx.getDataDir());
-            }
+                purgeIntegrityDirs(dataDir);
+                if (deCtx != null && deCtx.getDataDir() != null) {
+                    purgeIntegrityDirs(deCtx.getDataDir());
+                }
 
-            // Write new stamp.
-            try (FileWriter w = new FileWriter(stampFile, false)) {
-                w.write(currentStamp);
+                writeStampAtomic(dataDir, stampFile, currentStamp);
+                Log.i(TAG, "Purged DroidGuard/Integrity caches on state change: " + currentStamp);
             }
-            Log.i(TAG, "Purged DroidGuard/Integrity caches on state change: " + currentStamp);
         } catch (Throwable t) {
             Log.w(TAG, "maybePurgeDroidGuard failed", t);
+        }
+    }
+
+    private static String readStamp(File stampFile) {
+        if (!stampFile.exists()) return null;
+        try (BufferedReader r = new BufferedReader(new FileReader(stampFile))) {
+            String line = r.readLine();
+            return line != null ? line.trim() : "";
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void writeStampAtomic(File dataDir, File stampFile, String stamp)
+            throws Exception {
+        File tmp = new File(dataDir, DG_STAMP_FILE + ".tmp." + Process.myPid());
+        try (FileOutputStream out = new FileOutputStream(tmp, false)) {
+            out.write(stamp.getBytes(StandardCharsets.UTF_8));
+            out.getFD().sync();
+        }
+        if (!tmp.renameTo(stampFile)) {
+            tmp.delete();
+            try (FileOutputStream out = new FileOutputStream(stampFile, false)) {
+                out.write(stamp.getBytes(StandardCharsets.UTF_8));
+            }
         }
     }
 
@@ -617,25 +648,26 @@ public final class YasvaraSpoofEngine {
         deleteDirRecursive(new File(rootDir, "app_dg_cache"));
         deleteDirRecursive(new File(rootDir, "files/gmscompliance"));
         deleteFileByNameRecursive(rootDir, "gmscompliance.pb");
-        purgeMatchingFiles(new File(rootDir, "files"));
-        purgeMatchingFiles(new File(rootDir, "files/finsky/shared"));
-        purgeMatchingFiles(new File(rootDir, "shared_prefs"));
-        purgeMatchingFiles(new File(rootDir, "cache"));
+        purgeMatchingEntries(new File(rootDir, "files"));
+        purgeMatchingEntries(new File(rootDir, "files/finsky/shared"));
+        purgeMatchingEntries(new File(rootDir, "shared_prefs"));
+        purgeMatchingEntries(new File(rootDir, "cache"));
     }
 
-    private static void purgeMatchingFiles(File dir) {
+    private static void purgeMatchingEntries(File dir) {
         if (dir == null || !dir.isDirectory()) return;
         File[] children = dir.listFiles();
         if (children == null) return;
         for (File child : children) {
-            if (child.isDirectory()) continue;
             String name = child.getName().toLowerCase(java.util.Locale.ROOT);
-            if (name.contains("droidguard") || name.contains("play_integrity")
-                    || name.contains("express_integrity") || name.contains("device_integrity")
-                    || name.contains("gmscompliance") || name.startsWith("compliance_product_id")
+            if (name.contains("droidguard") || name.contains("droid_guard")
+                    || name.contains("play_integrity") || name.contains("express_integrity")
+                    || name.contains("device_integrity") || name.contains("device_verification")
+                    || name.contains("key_attestation") || name.contains("gmscompliance")
+                    || name.startsWith("compliance_product_id")
                     || name.startsWith("integrity_service_sharedprefs")
                     || "dg_shared_preferences.xml".equals(name)) {
-                child.delete();
+                deleteDirRecursive(child);
             }
         }
     }
