@@ -860,12 +860,9 @@ public:
     void setSourceResourceId(const uint32_t resId);
     uint32_t getSourceResourceId() const;
 
-    // Yasvara: Kait deterministic access to attribute resource ID slot and current extension.
-    uint32_t* kaitMutableAttrNameResIdSlot(int32_t nameId) const;
-    const void* kaitCurrentExt() const { return mCurExt; }
-
 private:
     friend class ResXMLTree;
+    friend struct ResXmlInternalOps;
     
     event_code_t nextNode();
 
@@ -914,6 +911,7 @@ public:
 
 private:
     friend class ResXMLParser;
+    friend struct ResXmlInternalOps;
 
     static std::unique_ptr<ResXMLTree> fromAsset(std::unique_ptr<Asset>&& asset,
                                                  std::unique_ptr<ResXMLTree> tree);

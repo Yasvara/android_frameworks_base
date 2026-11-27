@@ -22,6 +22,8 @@ import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.Settings;
+import android.security.keystore.KeyInfo;
+import android.security.keystore.KeyProperties;
 import android.system.Os;
 import android.system.StructUtsname;
 import android.text.TextUtils;
@@ -37,7 +39,12 @@ import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.security.Key;
+import java.security.KeyFactory;
+import java.security.KeyStore;
+import java.security.PrivateKey;
 import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +80,8 @@ public final class YasvaraSpoofEngine {
     static final String KEY_KEYBOX_STAMP = YasvaraIntegrityContract.SECURE_KEYBOX_STAMP;
     static final String KEY_RKP_MANUFACTURER = YasvaraIntegrityContract.SECURE_RKP_MANUFACTURER;
     static final String KEY_PATCH_OVERRIDE = YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE;
+    /** Neutral Settings.Secure key storing per-package risk/DFP cache reset epochs ("pkg=ms,..."). */
+    public static final String KEY_RISK_CACHE_RESET = YasvaraRiskCacheReset.KEY_RISK_CACHE_RESET;
     private static final String DG_STAMP_FILE = ".yasvara_dg_stamp";
     private static final String DG_STAMP_LOCK_FILE = ".yasvara_dg_stamp.lock";
 
@@ -166,7 +175,13 @@ public final class YasvaraSpoofEngine {
             if (context == null) return;
             final String packageName = context.getPackageName();
             if (TextUtils.isEmpty(packageName)) return;
-            if (Process.isIsolated() || isCameraExempt(packageName)) return;
+            if (Process.isIsolated()) return;
+
+            // Execute any pending user-triggered Tabir risk/DFP cache reset before Application.onCreate
+            // (runs in-process with the app's own UID — zero root, preserves login/session).
+            maybeResetObserverRiskCache(context, packageName);
+
+            if (isCameraExempt(packageName)) return;
 
             String processName = Application.getProcessName();
             if (TextUtils.isEmpty(processName)) processName = packageName;
@@ -177,31 +192,30 @@ public final class YasvaraSpoofEngine {
             sPropSpoofGate = 2;
             sRkpManufacturer = null;
 
-            final int mode = getInt(context, KEY_SPOOF_MODE, MODE_AUTO);
-            final boolean forceFull = mode == MODE_FULL;
-            final boolean forceModelOnly = mode == MODE_MODEL_ONLY;
-
             // 1. Per-app profile (Laras for media apps, Pentas for games).
             final YasvaraSpoofProfiles.Profile assigned =
                     YasvaraSpoofProfiles.profileFor(context.getContentResolver(), packageName);
             if (assigned != null) {
-                applyProfile(assigned.props, forceFull ? FULL_KEYS : MODEL_ONLY_KEYS);
+                final int mode = getInt(context, KEY_SPOOF_MODE, MODE_AUTO);
+                applyProfile(assigned.props, mode == MODE_FULL ? FULL_KEYS : MODEL_ONLY_KEYS);
                 return;
             }
 
             // 2. Feature rules: Photos unlimited + Snapchat.
             if (PKG_PHOTOS.equals(packageName)) {
                 if (getInt(context, KEY_PHOTOS_SPOOF, 1) == 1) {
+                    final int mode = getInt(context, KEY_SPOOF_MODE, MODE_AUTO);
                     applyProfile(YasvaraSpoofProfiles.builtInProfile("marlin").props,
-                            forceModelOnly ? MODEL_ONLY_KEYS : FULL_KEYS);
+                            mode == MODE_MODEL_ONLY ? MODEL_ONLY_KEYS : FULL_KEYS);
                     sPhotosFeatures = true;
                 }
                 return;
             }
             if (PKG_SNAPCHAT.equals(packageName)) {
                 if (getInt(context, KEY_SNAP_SPOOF, 1) == 1) {
+                    final int mode = getInt(context, KEY_SPOOF_MODE, MODE_AUTO);
                     applyProfile(YasvaraSpoofProfiles.builtInProfile("marlin").props,
-                            forceModelOnly ? MODEL_ONLY_KEYS : FULL_KEYS);
+                            mode == MODE_MODEL_ONLY ? MODEL_ONLY_KEYS : FULL_KEYS);
                 }
                 return;
             }
@@ -500,10 +514,99 @@ public final class YasvaraSpoofEngine {
     }
 
     /**
-     * Purges DroidGuard's SQLite token cache (dg.db) and VM bytecode cache (app_dgp)
-     * inside com.google.android.gms.unstable (and Play Integrity caches in GMS/Vending)
-     * whenever any attestation-relevant state (PIF toggle/profile, TrickyStore toggle,
-     * patch override, keybox, measured boot digest, or kernel release) changes.
+     * Resets stale anti-fraud / device-fingerprint caches (including Shopee/SeaBank {@code key_dfp}
+     * MMKV & {@code SPHelper_sp_main_bank.xml}) on first launch after the user taps "Reset Risk
+     * Cache" in Tabir, while preserving login/session files. Delegates to pure-Java SSOT
+     * {@link YasvaraRiskCacheReset} with a zero-allocation fast path when unset.
+     */
+    private static void maybeResetObserverRiskCache(Context context, String packageName) {
+        try {
+            final ContentResolver cr = context.getContentResolver();
+            if (cr == null) return;
+            final String raw = Settings.Secure.getString(cr, KEY_RISK_CACHE_RESET);
+            if (TextUtils.isEmpty(raw) || !raw.contains(packageName)) return;
+
+            UserManager um = context.getSystemService(UserManager.class);
+            if (um != null && !um.isUserUnlocked()) return;
+
+            File ceDataDir = context.getDataDir();
+            Context deCtx = context.createDeviceProtectedStorageContext();
+            File deDataDir = deCtx != null ? deCtx.getDataDir() : null;
+            if (YasvaraRiskCacheReset.applyIfNeeded(
+                    ceDataDir,
+                    deDataDir,
+                    packageName,
+                    raw,
+                    Process.myPid(),
+                    () -> purgeStaleAttestationKeys(packageName))) {
+                Log.i(TAG, "Reset risk/DFP cache & stale attestation keys for " + packageName);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "maybeResetObserverRiskCache failed for " + packageName, t);
+        }
+    }
+
+    /**
+     * Deletes stale KeyAttestation / {@code PURPOSE_ATTEST_KEY} aliases in AndroidKeyStore during
+     * a user-triggered Tabir risk-cache reset so Keystore2 provisions a fresh TrickyStore-managed
+     * keypair instead of reusing a pre-existing unmanaged or expired hardware attestation key.
+     *
+     * <p>Strictly skips protected user, biometric, encryption, and payment keys.
+     */
+    private static void purgeStaleAttestationKeys(String packageName) {
+        try {
+            KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
+            ks.load(null);
+            Enumeration<String> aliases = ks.aliases();
+            if (aliases == null) return;
+            List<String> toDelete = new ArrayList<>();
+            while (aliases.hasMoreElements()) {
+                String alias = aliases.nextElement();
+                if (YasvaraRiskCacheReset.isProtectedKeyAlias(alias)) {
+                    continue;
+                }
+                if (YasvaraRiskCacheReset.isStaleAttestationAlias(alias)
+                        || isPurposeAttestKey(ks, alias)) {
+                    toDelete.add(alias);
+                }
+            }
+            int deleted = 0;
+            for (String alias : toDelete) {
+                try {
+                    ks.deleteEntry(alias);
+                    deleted++;
+                } catch (Throwable ignored) {
+                }
+            }
+            if (deleted > 0) {
+                Log.i(TAG, "Purged " + deleted + " stale attestation key(s) for " + packageName);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "purgeStaleAttestationKeys failed for " + packageName, t);
+        }
+    }
+
+    private static boolean isPurposeAttestKey(KeyStore ks, String alias) {
+        try {
+            Key key = ks.getKey(alias, null);
+            if (!(key instanceof PrivateKey)) return false;
+            KeyFactory kf = KeyFactory.getInstance(key.getAlgorithm(), "AndroidKeyStore");
+            KeyInfo info = kf.getKeySpec(key, KeyInfo.class);
+            return info != null && (info.getPurposes() & KeyProperties.PURPOSE_ATTEST_KEY) != 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Purges DroidGuard's SQLite verdict cache (dg.db), GMS compliance stores, and Play Store
+     * integrity valuestores inside GMS/Play Store whenever any attestation-relevant state (PIF
+     * toggle/profile, TrickyStore toggle, patch override, keybox, measured boot digest, or kernel
+     * release) changes.
+     *
+     * <p>Signed DroidGuard VM bytecode caches ({@code app_dg_cache} and {@code app_dgp}) are
+     * intentionally preserved: they are content-addressed by VM SHA-1 (not verdict caches), and
+     * deleting them forces a ~1.6s cold VM download on Check #1 that transiently degrades to BASIC.
      */
     private static void maybePurgeDroidGuard(
             Context context, boolean pifEnabled, Map<String, String> pif) {
@@ -579,7 +682,7 @@ public final class YasvaraSpoofEngine {
 
     private static void writeStampAtomic(File dataDir, File stampFile, String stamp)
             throws Exception {
-        File tmp = new File(dataDir, DG_STAMP_FILE + ".tmp." + Process.myPid());
+        File tmp = new File(dataDir, stampFile.getName() + ".tmp." + Process.myPid());
         try (FileOutputStream out = new FileOutputStream(tmp, false)) {
             out.write(stamp.getBytes(StandardCharsets.UTF_8));
             out.getFD().sync();
@@ -644,8 +747,8 @@ public final class YasvaraSpoofEngine {
 
     static void purgeIntegrityDirs(File rootDir) {
         if (rootDir == null || !rootDir.exists()) return;
-        deleteDirRecursive(new File(rootDir, "app_dgp"));
-        deleteDirRecursive(new File(rootDir, "app_dg_cache"));
+        // Preserve app_dg_cache and app_dgp (content-addressed signed DroidGuard VM bytecode)
+        // so Check #1 immediately after purge avoids a ~1.6s cold VM fetch and stays STRONG.
         deleteDirRecursive(new File(rootDir, "files/gmscompliance"));
         deleteFileByNameRecursive(rootDir, "gmscompliance.pb");
         purgeMatchingEntries(new File(rootDir, "files"));

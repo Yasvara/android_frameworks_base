@@ -5,12 +5,16 @@
 package com.android.server.yasvara.kait;
 
 import android.app.ActivityManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.os.Binder;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Process;
@@ -22,6 +26,7 @@ import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Slog;
 
+import com.android.internal.os.BackgroundThread;
 import com.android.server.LocalServices;
 import com.android.server.pm.UserManagerInternal;
 
@@ -81,6 +86,7 @@ final class KaitManagerService extends IYasvaraKait.Stub {
     }
 
     private final Context mContext;
+    private final Handler mHandler = BackgroundThread.getHandler();
     private final KaitConfig mConfig = new KaitConfig();
     private final ModuleLoader mLoader = new ModuleLoader();
     private final AtomicLong mNextTargetId = new AtomicLong(1L);
@@ -98,6 +104,126 @@ final class KaitManagerService extends IYasvaraKait.Stub {
     KaitManagerService(Context context) {
         mContext = context;
         syncHideSwitch();
+        registerLifecycleReceivers();
+    }
+
+    private void registerLifecycleReceivers() {
+        final IntentFilter pkgFilter = new IntentFilter();
+        pkgFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        pkgFilter.addAction(Intent.ACTION_PACKAGE_FULLY_REMOVED);
+        pkgFilter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+        pkgFilter.addDataScheme("package");
+        mContext.registerReceiverAsUser(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                try {
+                    if (intent == null || intent.getData() == null) return;
+                    final String pkg = intent.getData().getSchemeSpecificPart();
+                    if (pkg == null || pkg.isEmpty()) return;
+                    final String action = intent.getAction();
+                    final int uid = intent.getIntExtra(Intent.EXTRA_UID, -1);
+                    final int userId = uid >= 0 ? UserHandle.getUserId(uid) : UserHandle.USER_SYSTEM;
+                    if (Intent.ACTION_PACKAGE_REPLACED.equals(action)) {
+                        onPackageReplaced(pkg, userId);
+                    } else if (Intent.ACTION_PACKAGE_FULLY_REMOVED.equals(action)
+                            || (Intent.ACTION_PACKAGE_REMOVED.equals(action)
+                                    && !intent.getBooleanExtra(Intent.EXTRA_REPLACING, false))) {
+                        onPackageRemoved(pkg, userId);
+                    }
+                } catch (Throwable t) {
+                    Slog.w(TAG, "package lifecycle receiver failed", t);
+                }
+            }
+        }, UserHandle.ALL, pkgFilter, null, mHandler);
+
+        mContext.registerReceiverAsUser(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                try {
+                    mContext.unregisterReceiver(this);
+                } catch (IllegalArgumentException ignored) {
+                }
+                pruneUninstalledModules();
+            }
+        }, UserHandle.SYSTEM, new IntentFilter(Intent.ACTION_LOCKED_BOOT_COMPLETED), null, mHandler);
+    }
+
+    private boolean isInstalledInAnyUser(String pkg) {
+        final PackageManager pm = mContext.getPackageManager();
+        for (int u : allUserIds()) {
+            try {
+                if (pm.getApplicationInfoAsUser(pkg,
+                        PackageManager.ApplicationInfoFlags.of(0), u) != null) {
+                    return true;
+                }
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // check next user
+            }
+        }
+        return false;
+    }
+
+    private void onPackageReplaced(String pkg, int userId) {
+        mLoader.pruneMissing();
+        final ApplicationInfo info = moduleInfo(pkg, userId);
+        if (info != null && info.sourceDir != null) {
+            mLoader.invalidate(info.sourceDir);
+        }
+    }
+
+    private void onPackageRemoved(String pkg, int userId) {
+        if (!mConfig.knownModules().contains(pkg)) return;
+        final long token = Binder.clearCallingIdentity();
+        try {
+            mLoader.pruneMissing();
+            if (!isInstalledInAnyUser(pkg)) {
+                final ArrayMap<Integer, List<String>> prevScopes = new ArrayMap<>();
+                for (int u : allUserIds()) {
+                    final List<String> scoped = mConfig.getScope(pkg, u);
+                    if (!scoped.isEmpty()) prevScopes.put(u, scoped);
+                }
+                mConfig.forget(pkg);
+                syncHideSwitch();
+                for (int i = 0; i < prevScopes.size(); i++) {
+                    final int u = prevScopes.keyAt(i);
+                    for (String target : prevScopes.valueAt(i)) {
+                        resetCrashState(target, u);
+                        restart(target, u);
+                    }
+                }
+                resetCrashState(pkg, userId);
+                Slog.i(TAG, "Forgot uninstalled Kait module " + pkg);
+            } else {
+                final List<String> removed = mConfig.setScope(pkg, userId, java.util.Collections.emptyList());
+                for (String target : removed) {
+                    resetCrashState(target, userId);
+                    restart(target, userId);
+                }
+                resetCrashState(pkg, userId);
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    private void pruneUninstalledModules() {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            boolean changed = false;
+            for (String pkg : mConfig.knownModules()) {
+                if (!isInstalledInAnyUser(pkg)) {
+                    mConfig.forget(pkg);
+                    changed = true;
+                    Slog.i(TAG, "Pruned orphaned Kait module on boot: " + pkg);
+                }
+            }
+            if (changed) {
+                mLoader.pruneMissing();
+                syncHideSwitch();
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private static final String HIDE_SWITCH = "/sys/kernel/yasvara_hide/kait";

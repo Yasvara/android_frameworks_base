@@ -132,4 +132,10 @@ interface IYasvaraAppVisibility {
 
     /** Force-stops a single package (e.g. observer app before re-testing in Laras). */
     boolean forceStopPackage(String packageName);
+
+    /**
+     * Schedules a login-preserving risk/DFP cache reset (e.g. Shopee/SeaBank key_dfp and generic
+     * anti-fraud caches) on the observer's next launch, clears its app cache, and force-stops it.
+     */
+    boolean resetObserverRiskCache(String packageName);
 }

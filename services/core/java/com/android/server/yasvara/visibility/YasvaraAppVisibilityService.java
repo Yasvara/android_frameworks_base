@@ -20,6 +20,9 @@ import android.hardware.usb.UsbManager;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.UserHandle;
+import android.provider.Settings;
+import android.security.yasvara.YasvaraRiskCacheReset;
+import android.security.yasvara.YasvaraSpoofEngine;
 import android.security.yasvara.YasvaraTabirPolicy;
 import android.util.ArrayMap;
 import android.util.ArraySet;
@@ -32,6 +35,7 @@ import com.android.internal.util.DumpUtils;
 import com.android.modules.utils.TypedXmlPullParser;
 import com.android.modules.utils.TypedXmlSerializer;
 import com.android.server.yasvara.kait.ModuleLoader;
+import com.android.server.yasvara.root.YasvaraRootService;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -92,7 +96,16 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
                     "io.github.muntashirakon.AppManager",
                     "eu.chainfire.supersu",
                     "com.keramidas.TitaniumBackup",
-                    "stericson.busybox"
+                    "stericson.busybox",
+                    "io.github.a13e300.ksuwebui",
+                    "io.github.vvb2060.keyattestation",
+                    "gr.nikolasspyr.integritycheck",
+                    "com.eltavine.duckdetector",
+                    "io.github.vvb2060.mahoshojo",
+                    "io.github.vvb2060.momo",
+                    "com.reveny.nativecheck",
+                    "icu.nullptr.nativetest",
+                    "com.zhenxi.hunter"
             ));
 
     private static final class TemplateRule {
@@ -181,6 +194,7 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
                 || pkg.startsWith("lineageos.platform.")
                 || pkg.startsWith("com.android.settings.lineage")
                 || pkg.startsWith("org.yasvara.")
+                || pkg.startsWith("com.mtg.")
                 || pkg.startsWith("org.protonaosp.")
                 || pkg.startsWith("org.omnirom.")
                 || pkg.startsWith("com.crdroid.")
@@ -567,6 +581,54 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
             return true;
         } catch (RuntimeException e) {
             Slog.w(TAG, "Failed to force-stop " + packageName, e);
+            return false;
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+    }
+
+    @Override
+    public boolean resetObserverRiskCache(String packageName) {
+        enforce();
+        if (!YasvaraRiskCacheReset.isValidPackageName(packageName)) {
+            return false;
+        }
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            PackageManager pm = mContext.getPackageManager();
+            ApplicationInfo ai;
+            try {
+                ai = pm.getApplicationInfo(packageName, 0);
+            } catch (PackageManager.NameNotFoundException e) {
+                return false;
+            }
+            if (UserHandle.getAppId(ai.uid) < YasvaraTabirPolicy.FIRST_APPLICATION_UID) {
+                return false;
+            }
+
+            final long now = System.currentTimeMillis();
+            final String existing = Settings.Secure.getString(
+                    mContext.getContentResolver(), YasvaraRiskCacheReset.KEY_RISK_CACHE_RESET);
+            final String updated = YasvaraRiskCacheReset.mergePackageEpoch(
+                    existing, packageName, now);
+            Settings.Secure.putString(
+                    mContext.getContentResolver(),
+                    YasvaraRiskCacheReset.KEY_RISK_CACHE_RESET,
+                    updated);
+
+            try {
+                pm.deleteApplicationCacheFiles(packageName, null);
+            } catch (RuntimeException e) {
+                Slog.w(TAG, "deleteApplicationCacheFiles failed for " + packageName, e);
+            }
+
+            ActivityManager am = mContext.getSystemService(ActivityManager.class);
+            if (am != null) {
+                am.forceStopPackage(packageName);
+            }
+            return true;
+        } catch (RuntimeException e) {
+            Slog.w(TAG, "resetObserverRiskCache failed for " + packageName, e);
             return false;
         } finally {
             Binder.restoreCallingIdentity(ident);
@@ -1041,6 +1103,12 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
                 if (!hideableRom && appId >= YasvaraTabirPolicy.FIRST_APPLICATION_UID) {
                     protectedSystemAppIds.add(appId);
                 }
+                // System Xposed modules (e.g. org.yasvara.ketik.hook, org.yasvara.alih.bridge)
+                // must also have xposed* manifest meta-data stripped for non-exempt apps.
+                if (app.metaData != null && app.metaData.containsKey(META_XPOSED)) {
+                    modulesSet.add(pkg);
+                    xposedModuleAppIds.add(appId);
+                }
                 continue;
             }
 
@@ -1096,7 +1164,8 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
             final boolean hideableRom = isHideableRomPackage(pkg);
             if (sys) {
                 if ((mHideRomPackages && hideableRom)
-                        || (hideableRom && mHidden.contains(pkg))) {
+                        || (hideableRom && mHidden.contains(pkg))
+                        || (mHideXposed && hideableRom && modulesSet.contains(pkg))) {
                     globalHiddenRomPackages.add(pkg);
                     if (appId >= YasvaraTabirPolicy.FIRST_APPLICATION_UID
                             && !protectedSystemAppIds.contains(appId)) {
@@ -1245,6 +1314,15 @@ public final class YasvaraAppVisibilityService extends IYasvaraAppVisibility.Stu
         AppVisibilityPolicy.install(builder.build());
         PackageManager.invalidatePackageInfoCache();
         BroadcastStickyCache.invalidateCache(UsbManager.ACTION_USB_STATE);
+
+        // Sync Tabir's explicitly protected observers into Akar's Zygisk DenyList & Force-Unmount
+        // asynchronously so one unified shield covers PackageManager, Zygisk, and module mounts.
+        ArraySet<Integer> protectedForAkar = new ArraySet<>(observerCallers);
+        for (int i = 0; i < overrideCallers.length; i++) {
+            protectedForAkar.add(overrideCallers[i]);
+        }
+        final int[] syncUids = toIntArray(protectedForAkar);
+        mHandler.post(() -> YasvaraRootService.syncTabirProtectedUids(syncUids));
     }
 
     private boolean isModule(ApplicationInfo app, boolean allowApkZipScan) {

@@ -26,6 +26,7 @@
 #include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
 #include <android/fdsan.h>
+#include <androidfw/ResourceTypes.h>
 #include <arpa/inet.h>
 #include <async_safe/log.h>
 #include <binder/ProcessState.h>
@@ -74,7 +75,6 @@
 #include <unistd.h>
 #include <utils/String8.h>
 #include <utils/Trace.h>
-#include <dlfcn.h>
 
 #include <algorithm>
 #include <mutex>
@@ -99,6 +99,54 @@
 #include <android/dlext_private.h>
 extern "C" void android_reset_stack_guards();
 #endif
+
+// Private ResXML helper vtable passed directly to libyasvara_kait.so (zero exported
+// yasvara_kait_* symbols on libandroidfw.so or libandroid_runtime.so).
+namespace android {
+struct __attribute__((visibility("hidden"))) ResXmlInternalOps {
+    static int32_t Next(void* parser_ptr) {
+        auto* parser = static_cast<ResXMLParser*>(parser_ptr);
+        return parser ? static_cast<int32_t>(parser->next()) : ResXMLParser::BAD_DOCUMENT;
+    }
+    static void Restart(void* parser_ptr) {
+        if (auto* parser = static_cast<ResXMLParser*>(parser_ptr)) {
+            parser->restart();
+        }
+    }
+    static const void* CurExt(void* parser_ptr) {
+        auto* parser = static_cast<ResXMLParser*>(parser_ptr);
+        return parser ? parser->mCurExt : nullptr;
+    }
+    static int32_t AttrNameId(void* parser_ptr, size_t idx) {
+        auto* parser = static_cast<ResXMLParser*>(parser_ptr);
+        return parser ? parser->getAttributeNameID(idx) : -1;
+    }
+    static uint32_t AttrNameResId(void* parser_ptr, size_t idx) {
+        auto* parser = static_cast<ResXMLParser*>(parser_ptr);
+        return parser ? parser->getAttributeNameResID(idx) : 0;
+    }
+    static uint32_t* MutableAttrSlot(void* parser_ptr, int32_t name_id) {
+        auto* parser = static_cast<ResXMLParser*>(parser_ptr);
+        if (!parser || name_id < 0) return nullptr;
+        if (static_cast<size_t>(name_id) < parser->mTree.mNumResIds &&
+            parser->mTree.mResIds != nullptr) {
+            return const_cast<uint32_t*>(&parser->mTree.mResIds[name_id]);
+        }
+        return nullptr;
+    }
+    static const uint16_t* AttrNameUtf16(void* parser_ptr, int32_t name_id, size_t* out_len) {
+        auto* parser = static_cast<ResXMLParser*>(parser_ptr);
+        if (!parser || name_id < 0 || !out_len) return nullptr;
+        auto str = parser->getStrings().stringAt(static_cast<size_t>(name_id));
+        if (!str.has_value()) {
+            *out_len = 0;
+            return nullptr;
+        }
+        *out_len = str->size();
+        return reinterpret_cast<const uint16_t*>(str->data());
+    }
+};
+}  // namespace android
 
 namespace {
 
@@ -1924,6 +1972,30 @@ static void BindMountStorageDirs(JNIEnv* env, jobjectArray pkg_data_info_list,
   }
 }
 
+struct KaitResXmlOps {
+    uint32_t version;
+    uint32_t reserved;
+    int32_t (*next)(void*);
+    void (*restart)(void*);
+    const void* (*cur_ext)(void*);
+    int32_t (*attr_name_id)(void*, size_t);
+    uint32_t (*attr_name_res_id)(void*, size_t);
+    uint32_t* (*mutable_attr_slot)(void*, int32_t);
+    const uint16_t* (*attr_name_utf16)(void*, int32_t, size_t*);
+};
+
+static const KaitResXmlOps kKaitResXmlOps = {
+        .version = 1,
+        .reserved = 0,
+        .next = &::android::ResXmlInternalOps::Next,
+        .restart = &::android::ResXmlInternalOps::Restart,
+        .cur_ext = &::android::ResXmlInternalOps::CurExt,
+        .attr_name_id = &::android::ResXmlInternalOps::AttrNameId,
+        .attr_name_res_id = &::android::ResXmlInternalOps::AttrNameResId,
+        .mutable_attr_slot = &::android::ResXmlInternalOps::MutableAttrSlot,
+        .attr_name_utf16 = &::android::ResXmlInternalOps::AttrNameUtf16,
+};
+
 // Yasvara Kait: system_server flags scoped processes with Zygote.YASVARA_KAIT.
 // Only those processes activate ART's KaitArtOps and map libyasvara_kait.so (vendor/yasvara/kait).
 // Every failure leaves the process running unhooked.
@@ -1934,13 +2006,13 @@ static void YasvaraKaitAttach(JNIEnv* env, jstring nice_name, jstring app_data_d
         ALOGE("Kait runtime unavailable: %s", dlerror());
         return;
     }
-    using AttachFn = jboolean (*)(JNIEnv*, jstring, jstring, jboolean);
+    using AttachFn = jboolean (*)(JNIEnv*, jstring, jstring, jboolean, const KaitResXmlOps*);
     auto attach = reinterpret_cast<AttachFn>(dlsym(handle, "yasvara_kait_attach"));
     if (attach == nullptr) {
         ALOGE("Kait runtime has no entry point");
         return;
     }
-    attach(env, nice_name, app_data_dir, is_system_server ? JNI_TRUE : JNI_FALSE);
+    attach(env, nice_name, app_data_dir, is_system_server ? JNI_TRUE : JNI_FALSE, &kKaitResXmlOps);
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
@@ -1985,6 +2057,7 @@ static bool gTabirZygiskSafeBypass = false;
 static bool gTabirZygiskHasSystemServer = false;
 static std::vector<uint32_t> gTabirZygiskDenylist;
 static std::vector<YasvaraZygiskModuleCache> gTabirZygiskModules;
+static std::vector<yasvara::tabir::ZygiskModuleView> gTabirZygiskViews;
 // One sealed memfd per module, in set-file order. Created when the parent refreshes the cache;
 // ignored by the fd table check, inherited, and closed by every child in SpecializeCommon.
 static std::vector<int> gZygiskSharedFds;
@@ -2149,6 +2222,7 @@ static void TabirRefreshZygiskCache() {
             gTabirZygiskHasSystemServer = false;
             gTabirZygiskDenylist.clear();
             gTabirZygiskModules.clear();
+            gTabirZygiskViews.clear();
             DropZygiskSharedTexts();
             gTabirZygiskMtime = {};
             gTabirZygiskSize = -1;
@@ -2194,6 +2268,12 @@ static void TabirRefreshZygiskCache() {
     gTabirZygiskHasSystemServer = (set.flags & yasvara::tabir::kZygiskHasSystemServer) != 0;
     gTabirZygiskDenylist.swap(set.denylist);
     gTabirZygiskModules.swap(mods);
+    gTabirZygiskViews.clear();
+    gTabirZygiskViews.reserve(gTabirZygiskModules.size());
+    for (const auto& m : gTabirZygiskModules) {
+        gTabirZygiskViews.push_back(
+                {m.has_abi, m.scope_mode, m.scope_uids.data(), m.scope_uids.size()});
+    }
     gTabirZygiskMtime = st.st_mtim;
     gTabirZygiskSize = st.st_size;
 }
@@ -2291,17 +2371,12 @@ struct YasvaraZygiskServerArgs {
 
 static bool YasvaraZygiskShouldLoad(uid_t uid, bool is_system_server, bool is_child_zygote,
                                     bool& out_on_denylist) {
-    // Stack, not heap: this runs on the specialize path. The parser caps modules at 256.
-    yasvara::tabir::ZygiskModuleView views[256];
-    const size_t n = std::min(gTabirZygiskModules.size(), sizeof(views) / sizeof(views[0]));
-    for (size_t i = 0; i < n; ++i) {
-        const auto& m = gTabirZygiskModules[i];
-        views[i] = {m.has_abi, m.scope_mode, m.scope_uids.data(), m.scope_uids.size()};
-    }
     return yasvara::tabir::ZygiskShouldLoad(
             uid, is_system_server, is_child_zygote, gTabirZygiskEnabled, gTabirZygiskSafeBypass,
             gZygiskSsCircuitBroken, gTabirZygiskHasSystemServer, gTabirZygiskDenylist.data(),
-            gTabirZygiskDenylist.size(), n == 0 ? nullptr : views, n, &out_on_denylist);
+            gTabirZygiskDenylist.size(),
+            gTabirZygiskViews.empty() ? nullptr : gTabirZygiskViews.data(),
+            gTabirZygiskViews.size(), &out_on_denylist);
 }
 
 // Bind-mounts the object behind `src_fd` (an O_PATH handle) onto a fresh placeholder at `dst`.
@@ -2392,44 +2467,58 @@ static void SpecializeCommon(JNIEnv* env, uid_t uid, gid_t gid, jintArray gids, 
     // loads Zygisk modules, or unmounts module overlays. webview_zygote (uid 1053) and
     // app_zygote (uid >= 10000) skip this completely (zero stat syscalls, zero SELinux AVCs).
     void* yasvara_zygisk_handle = nullptr;
-    int32_t zygisk_uid = static_cast<int32_t>(uid);
-    int32_t zygisk_gid = static_cast<int32_t>(gid);
-    jint zygisk_runtime_flags = runtime_flags;
-    jint zygisk_mount_external = mount_external;
+    int32_t zygisk_uid = 0;
+    int32_t zygisk_gid = 0;
+    jint zygisk_runtime_flags = 0;
+    jint zygisk_mount_external = 0;
     jintArray zygisk_fds_to_ignore = nullptr;
-    uint8_t zygisk_is_child = is_child_zygote ? 1 : 0;
-    uint8_t zygisk_is_top = is_top_app ? 1 : 0;
-    uint8_t zygisk_mount_data = mount_data_dirs ? 1 : 0;
-    uint8_t zygisk_mount_storage = mount_storage_dirs ? 1 : 0;
-    uint8_t zygisk_mount_sysprop = mount_sysprop_overrides ? 1 : 0;
-    int64_t zygisk_perm_caps = static_cast<int64_t>(permitted_capabilities);
-    int64_t zygisk_eff_caps = static_cast<int64_t>(effective_capabilities);
+    uint8_t zygisk_is_child = 0;
+    uint8_t zygisk_is_top = 0;
+    uint8_t zygisk_mount_data = 0;
+    uint8_t zygisk_mount_storage = 0;
+    uint8_t zygisk_mount_sysprop = 0;
+    int64_t zygisk_perm_caps = 0;
+    int64_t zygisk_eff_caps = 0;
+    YasvaraZygiskAppArgs zygisk_app_args = {};
+    YasvaraZygiskServerArgs zygisk_server_args = {};
 
-    YasvaraZygiskAppArgs zygisk_app_args = {
-            &zygisk_uid, &zygisk_gid, &gids, &zygisk_runtime_flags, &rlimits,
-            &zygisk_mount_external, &managed_se_info, &managed_nice_name,
-            &managed_instruction_set, &managed_app_data_dir, &zygisk_fds_to_ignore,
-            &zygisk_is_child, &zygisk_is_top, &pkg_data_info_list,
-            &allowlisted_data_info_list, &zygisk_mount_data, &zygisk_mount_storage,
-            &zygisk_mount_sysprop,
-    };
-    YasvaraZygiskServerArgs zygisk_server_args = {
-            &zygisk_uid, &zygisk_gid, &gids, &zygisk_runtime_flags,
-            &zygisk_perm_caps, &zygisk_eff_caps,
-    };
-
-    if (getuid() == 0) {
+    const bool is_root_zygote = (getuid() == 0);
+    if (is_root_zygote) {
         TabirSyncCaches();  // equal serial after a plain fork: one load
     }
     bool yasvara_on_denylist = false;
     bool yasvara_force_unmount = false;
-    if (gTabirActive && getuid() == 0) {
-        const bool yasvara_enrolled = TabirUidEnrolled(uid);
+    bool yasvara_enrolled = false;
+    if (gTabirActive && is_root_zygote) {
+        yasvara_enrolled = TabirUidEnrolled(uid);
 
         // Yasvara ROM-Native Zygisk (Phase 1): loaded lazily ONLY inside scoped children (never
         // inside Zygote parent, never inside DenyList or out-of-scope apps).
-
         if (YasvaraZygiskShouldLoad(uid, is_system_server, is_child_zygote, yasvara_on_denylist)) {
+            zygisk_uid = static_cast<int32_t>(uid);
+            zygisk_gid = static_cast<int32_t>(gid);
+            zygisk_runtime_flags = runtime_flags;
+            zygisk_mount_external = mount_external;
+            zygisk_is_child = is_child_zygote ? 1 : 0;
+            zygisk_is_top = is_top_app ? 1 : 0;
+            zygisk_mount_data = mount_data_dirs ? 1 : 0;
+            zygisk_mount_storage = mount_storage_dirs ? 1 : 0;
+            zygisk_mount_sysprop = mount_sysprop_overrides ? 1 : 0;
+            zygisk_perm_caps = static_cast<int64_t>(permitted_capabilities);
+            zygisk_eff_caps = static_cast<int64_t>(effective_capabilities);
+            zygisk_app_args = {
+                    &zygisk_uid, &zygisk_gid, &gids, &zygisk_runtime_flags, &rlimits,
+                    &zygisk_mount_external, &managed_se_info, &managed_nice_name,
+                    &managed_instruction_set, &managed_app_data_dir, &zygisk_fds_to_ignore,
+                    &zygisk_is_child, &zygisk_is_top, &pkg_data_info_list,
+                    &allowlisted_data_info_list, &zygisk_mount_data, &zygisk_mount_storage,
+                    &zygisk_mount_sysprop,
+            };
+            zygisk_server_args = {
+                    &zygisk_uid, &zygisk_gid, &gids, &zygisk_runtime_flags,
+                    &zygisk_perm_caps, &zygisk_eff_caps,
+            };
+
             // Modules may mount in preAppSpecialize: never in Zygote's namespace, which every
             // later app inherits. Idempotent, so MountEmulatedStorage's own call is a no-op.
             if (!is_system_server) ensureInAppMountNamespace(fail_fn);
@@ -2450,6 +2539,7 @@ static void SpecializeCommon(JNIEnv* env, uid_t uid, gid_t gid, jintArray gids, 
                     yasvara_force_unmount = (out_flags & 1u) != 0;
                     // Modules edit the specialize arguments in place. Copy them back before
                     // storage mounts and the uid drop.
+                    const uid_t prev_uid = uid;
                     uid = static_cast<uid_t>(zygisk_uid);
                     gid = static_cast<gid_t>(zygisk_gid);
                     runtime_flags = zygisk_runtime_flags;
@@ -2463,6 +2553,9 @@ static void SpecializeCommon(JNIEnv* env, uid_t uid, gid_t gid, jintArray gids, 
                     effective_capabilities = static_cast<jlong>(zygisk_eff_caps);
                     yasvara_kait = !is_child_zygote &&
                             (runtime_flags & RuntimeFlags::YASVARA_KAIT) != 0;
+                    if (uid != prev_uid) {
+                        yasvara_enrolled = TabirUidEnrolled(uid);
+                    }
                 }
             }
         }
@@ -2484,8 +2577,7 @@ static void SpecializeCommon(JNIEnv* env, uid_t uid, gid_t gid, jintArray gids, 
     MountEmulatedStorage(uid, mount_external, need_pre_initialize_native_bridge, fail_fn);
     ensureInAppMountNamespace(fail_fn);
 
-    if (gTabirActive && getuid() == 0) {
-        const bool yasvara_enrolled = TabirUidEnrolled(uid);
+    if (gTabirActive && is_root_zygote) {
         // Only here, in the app's own namespace: projecting earlier mounts su into Zygote and
         // so into every app forked after it.
         TabirProject(uid, is_system_server, is_child_zygote);

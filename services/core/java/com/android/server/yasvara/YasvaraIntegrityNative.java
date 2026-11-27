@@ -34,4 +34,18 @@ final class YasvaraIntegrityNative {
 
     static native String nativeInferRelease(
             String fpRelease, String buildId, String platformRelease);
+
+    static native byte[] nativeCompilePolicySnapshot(
+            boolean trickyEnabled,
+            boolean pifEnabled,
+            boolean akarYielded,
+            long generation,
+            String rawPif,
+            String platformRelease,
+            String rkpManufacturer,
+            String[] targets,
+            String rawPatchOverrideJson,
+            String rawAppSpoofMapJson);
+
+    static native String[] nativePackRkpExemptSlots(String rawAppSpoofMapJson);
 }

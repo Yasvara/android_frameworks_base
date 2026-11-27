@@ -5,6 +5,7 @@
 package com.android.server.yasvara;
 
 import android.app.ActivityManager;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.database.ContentObserver;
@@ -73,6 +74,9 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
     private final YasvaraKeyboxStore mKeyboxStore = new YasvaraKeyboxStore();
     private KeyboxMeta mKeyboxMeta;
     private boolean mBootDigestStarted;
+    private boolean mLegacyCleaned;
+    private boolean mLegacyFilesCleaned;
+    private long mPolicyGeneration;
 
     public YasvaraAttestationService(Context context) {
         mContext = context;
@@ -87,21 +91,27 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             @Override
             public void run() {
                 startBootDigestPublisher();
-                if (!syncPif()) {
+                if (!syncPif(false)) {
                     handler.postDelayed(this, 1000);
                     return;
                 }
                 syncControl();
+                cleanupLegacySettings();
                 try {
                     final Uri pifConfigUri = Settings.Secure.getUriFor(
                             YasvaraIntegrityContract.SECURE_PIF_CONFIG);
                     final Uri pifEnabledUri = Settings.Secure.getUriFor(
                             YasvaraIntegrityContract.SECURE_PIF_ENABLED);
+                    final Uri appSpoofMapUri = Settings.Secure.getUriFor(
+                            YasvaraIntegrityContract.SECURE_APP_SPOOF_MAP);
                     ContentObserver observer = new ContentObserver(handler) {
                         @Override
                         public void onChange(boolean selfChange, Uri uri) {
-                            if (pifConfigUri.equals(uri) || pifEnabledUri.equals(uri)) {
-                                if (syncPif()) {
+                            if (appSpoofMapUri.equals(uri)) {
+                                syncAppSpoofExemptions();
+                                publishPolicySnapshot();
+                            } else if (pifConfigUri.equals(uri) || pifEnabledUri.equals(uri)) {
+                                if (syncPif(true)) {
                                     bumpPurgeGen();
                                     restartIntegrityProcesses(true);
                                 }
@@ -117,7 +127,8 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
                             YasvaraIntegrityContract.SECURE_PIF_ENABLED,
                             YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE,
                             YasvaraIntegrityContract.SECURE_TRICKY_ENABLED,
-                            YasvaraIntegrityContract.SECURE_TRICKY_TARGETS}) {
+                            YasvaraIntegrityContract.SECURE_TRICKY_TARGETS,
+                            YasvaraIntegrityContract.SECURE_APP_SPOOF_MAP}) {
                         mContext.getContentResolver().registerContentObserver(
                                 Settings.Secure.getUriFor(key), false, observer);
                     }
@@ -128,6 +139,29 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
                 }
             }
         });
+    }
+
+    private void cleanupLegacySettings() {
+        if (mLegacyCleaned) return;
+        mLegacyCleaned = true;
+        final long token = Binder.clearCallingIdentity();
+        try {
+            ContentResolver cr = mContext.getContentResolver();
+            int removed = 0;
+            for (String key : YasvaraIntegrityContract.LEGACY_SECURE_KEYS) {
+                if (Settings.Secure.getString(cr, key) != null) {
+                    cr.delete(Settings.Secure.getUriFor(key), null, null);
+                    removed++;
+                }
+            }
+            if (removed > 0) {
+                Slog.i(TAG, "Cleaned " + removed + " obsolete legacy Settings.Secure key(s)");
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "cleanupLegacySettings failed", t);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private void syncControl() {
@@ -145,21 +179,92 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             SystemProperties.set(
                     YasvaraIntegrityContract.PROP_PATCH_OVERRIDE, globalPatchOverride);
 
-            StringBuilder targets = new StringBuilder();
-            for (String pkg : YasvaraTrickyStore.effectiveTargets(mContext)) {
-                targets.append(pkg).append('\n');
-            }
+            syncAppSpoofExemptions();
             KeyboxMeta meta;
             synchronized (mLock) {
-                mKeyboxStore.publishConfig(
-                        YasvaraIntegrityContract.TARGETS_FILENAME, targets.toString());
-                mKeyboxStore.publishConfig(
-                        YasvaraIntegrityContract.PATCH_OVERRIDE_FILENAME, trimmedOverride);
                 meta = mKeyboxMeta;
             }
             updateRkpManufacturer(meta != null ? meta.rkpManufacturer : "", true);
+            publishPolicySnapshot();
         } catch (Throwable t) {
             Slog.w(TAG, "syncControl failed; keystore2 keeps its previous control state", t);
+        }
+    }
+
+    private void syncAppSpoofExemptions() {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            String rawMap = nonNull(Settings.Secure.getString(
+                    mContext.getContentResolver(),
+                    YasvaraIntegrityContract.SECURE_APP_SPOOF_MAP));
+            String[] slots = YasvaraIntegrityNative.nativePackRkpExemptSlots(rawMap);
+            if (slots == null) return;
+            for (int i = 0; i < slots.length
+                    && i < YasvaraIntegrityContract.RKP_EXEMPT_MAX_SLOTS; i++) {
+                String prop = YasvaraIntegrityContract.PROP_RKP_EXEMPT_PREFIX + i;
+                String val = nonNull(slots[i]);
+                if (!val.equals(SystemProperties.get(prop, ""))) {
+                    SystemProperties.set(prop, val);
+                }
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "syncAppSpoofExemptions failed", t);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    private void publishPolicySnapshot() {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            ContentResolver cr = mContext.getContentResolver();
+            boolean trickyEnabled = YasvaraTrickyStore.isEnabled(mContext);
+            boolean pifSettingEnabled = Settings.Secure.getInt(
+                    cr, YasvaraIntegrityContract.SECURE_PIF_ENABLED, 0) == 1;
+            boolean akarYielded = isExternalPlayIntegrityModuleActive();
+            String rawPif = Settings.Secure.getString(
+                    cr, YasvaraIntegrityContract.SECURE_PIF_CONFIG);
+            if (rawPif == null || rawPif.trim().isEmpty()) {
+                rawPif = nonNull(readFallbackPif());
+            }
+            String platformRelease = SystemProperties.get("ro.build.version.release",
+                    Build.VERSION.RELEASE != null ? Build.VERSION.RELEASE : "17");
+            Collection<String> targetList = YasvaraTrickyStore.effectiveTargets(mContext);
+            String[] targets = targetList.toArray(new String[0]);
+            String rawOverride = nonNull(Settings.Secure.getString(
+                    cr, YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE));
+            String rawAppSpoofMap = nonNull(Settings.Secure.getString(
+                    cr, YasvaraIntegrityContract.SECURE_APP_SPOOF_MAP));
+
+            synchronized (mLock) {
+                String rkpMfg = mKeyboxMeta != null ? nonNull(mKeyboxMeta.rkpManufacturer) : "";
+                long gen = ++mPolicyGeneration;
+                byte[] snapshot = YasvaraIntegrityNative.nativeCompilePolicySnapshot(
+                        trickyEnabled,
+                        pifSettingEnabled,
+                        akarYielded,
+                        gen,
+                        rawPif,
+                        platformRelease,
+                        rkpMfg,
+                        targets,
+                        rawOverride,
+                        rawAppSpoofMap);
+                if (snapshot == null || snapshot.length == 0) {
+                    Slog.w(TAG, "nativeCompilePolicySnapshot returned empty buffer");
+                    return;
+                }
+                mKeyboxStore.publishBytes(YasvaraIntegrityContract.POLICY_FILENAME, snapshot);
+                if (!mLegacyFilesCleaned) {
+                    mLegacyFilesCleaned = true;
+                    mKeyboxStore.deleteConfig(YasvaraIntegrityContract.TARGETS_FILENAME);
+                    mKeyboxStore.deleteConfig(YasvaraIntegrityContract.PATCH_OVERRIDE_FILENAME);
+                }
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "publishPolicySnapshot failed", t);
+        } finally {
+            Binder.restoreCallingIdentity(token);
         }
     }
 
@@ -179,7 +284,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         return false;
     }
 
-    private boolean syncPif() {
+    private boolean syncPif(boolean publishSnapshot) {
         try {
             int pifEnabled = Settings.Secure.getInt(
                     mContext.getContentResolver(),
@@ -187,6 +292,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             if (pifEnabled != 1 || isExternalPlayIntegrityModuleActive()) {
                 SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
                 clearNativePif();
+                if (publishSnapshot) publishPolicySnapshot();
                 Slog.i(TAG, "PIF disabled or yielded to Akar module: native staging cleared");
                 return true;
             }
@@ -198,6 +304,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             if (rawPif == null || rawPif.trim().isEmpty()) {
                 SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
                 clearNativePif();
+                if (publishSnapshot) publishPolicySnapshot();
                 Slog.w(TAG, "Empty PIF config; cleared profile staging");
                 return true;
             }
@@ -207,16 +314,19 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
             if (flatPairs == null || flatPairs.length == 0 || (flatPairs.length & 1) != 0) {
                 SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
                 clearNativePif();
+                if (publishSnapshot) publishPolicySnapshot();
                 Slog.w(TAG, "Invalid PIF config; cleared profile staging");
                 return true;
             }
             if (!stageNativePif(flatPairs)) {
                 SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
                 clearNativePif();
+                if (publishSnapshot) publishPolicySnapshot();
                 Slog.w(TAG, "Partial PIF staging failure; reverted pif.enabled=0");
                 return false;
             }
             SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "1");
+            if (publishSnapshot) publishPolicySnapshot();
             Slog.i(TAG, "PIF synced via Rust normalizer");
             return true;
         } catch (Throwable t) {
@@ -420,6 +530,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
         updateKeyboxStamp(meta.stamp);
         updateRkpManufacturer(meta.rkpManufacturer, true);
+        publishPolicySnapshot();
         bumpPurgeGen();
         restartIntegrityProcesses(true);
     }
@@ -438,6 +549,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
         updateKeyboxStamp("");
         updateRkpManufacturer("", true);
+        publishPolicySnapshot();
         bumpPurgeGen();
         restartIntegrityProcesses(true);
     }

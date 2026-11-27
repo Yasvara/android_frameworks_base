@@ -984,6 +984,7 @@ public class ComputerEngine implements Computer {
                     flags, ps.getUserStateOrDefault(userId), userId, ps);
             if (ai != null) {
                 ai.packageName = resolveExternalPackageName(ps.getPkg());
+                stripXposedMetaData(ai, filterCallingUid);
             }
             return ai;
         }
@@ -1525,7 +1526,7 @@ public class ComputerEngine implements Computer {
     }
 
     private static void stripXposedMetaData(ApplicationInfo ai, int callingUid) {
-        if (ai == null) {
+        if (ai == null || ai.metaData == null) {
             return;
         }
         final int callingAppId = UserHandle.getAppId(callingUid);
@@ -1533,7 +1534,7 @@ public class ComputerEngine implements Computer {
         if (!YasvaraTabirPolicy.shouldStripXposedMetaData(callingAppId, targetAppId)) {
             return;
         }
-        stripXposedMetaDataBundle(ai.metaData);
+        ai.metaData = stripXposedMetaDataBundle(ai.metaData);
     }
 
     private static void stripXposedMetaData(PackageInfo pi, int callingUid) {
@@ -1545,38 +1546,52 @@ public class ComputerEngine implements Computer {
         if (!YasvaraTabirPolicy.shouldStripXposedMetaData(callingAppId, targetAppId)) {
             return;
         }
-        stripXposedMetaDataBundle(pi.applicationInfo.metaData);
+        pi.applicationInfo.metaData = stripXposedMetaDataBundle(pi.applicationInfo.metaData);
         if (pi.activities != null) {
             for (ActivityInfo ai : pi.activities) {
-                if (ai != null) stripXposedMetaDataBundle(ai.metaData);
+                if (ai != null) ai.metaData = stripXposedMetaDataBundle(ai.metaData);
             }
         }
         if (pi.services != null) {
             for (ServiceInfo si : pi.services) {
-                if (si != null) stripXposedMetaDataBundle(si.metaData);
+                if (si != null) si.metaData = stripXposedMetaDataBundle(si.metaData);
             }
         }
         if (pi.receivers != null) {
             for (ActivityInfo ai : pi.receivers) {
-                if (ai != null) stripXposedMetaDataBundle(ai.metaData);
+                if (ai != null) ai.metaData = stripXposedMetaDataBundle(ai.metaData);
             }
         }
         if (pi.providers != null) {
             for (ProviderInfo pri : pi.providers) {
-                if (pri != null) stripXposedMetaDataBundle(pri.metaData);
+                if (pri != null) pri.metaData = stripXposedMetaDataBundle(pri.metaData);
             }
         }
     }
 
-    private static void stripXposedMetaDataBundle(Bundle metaData) {
+    private static Bundle stripXposedMetaDataBundle(Bundle metaData) {
         if (metaData == null || metaData.isEmpty()) {
-            return;
+            return metaData;
         }
-        metaData.remove("xposedmodule");
-        metaData.remove("xposedminversion");
-        metaData.remove("xposeddescription");
-        metaData.remove("xposedscope");
-        metaData.remove("xposedsharedprefs");
+        if (!metaData.containsKey("xposedmodule")
+                && !metaData.containsKey("xposedminversion")
+                && !metaData.containsKey("xposeddescription")
+                && !metaData.containsKey("xposedscope")
+                && !metaData.containsKey("xposedsharedprefs")
+                && !metaData.containsKey("xposedlib")
+                && !metaData.containsKey("xposedinit")) {
+            return metaData;
+        }
+        // Defensive copy: PackageInfoUtils hands out AndroidPackage's shared Bundle instance.
+        Bundle copy = new Bundle(metaData);
+        copy.remove("xposedmodule");
+        copy.remove("xposedminversion");
+        copy.remove("xposeddescription");
+        copy.remove("xposedscope");
+        copy.remove("xposedsharedprefs");
+        copy.remove("xposedlib");
+        copy.remove("xposedinit");
+        return copy.isEmpty() ? null : copy;
     }
 
     private static Optional<Signature> generateFakeSignature(AndroidPackage p) {
@@ -4316,6 +4331,7 @@ public class ComputerEngine implements Computer {
             if (appInfo == null) {
                 return null;
             }
+            stripXposedMetaData(appInfo, callingUid);
             return PackageInfoUtils.generateProviderInfo(ps.getPkg(), p, flags, state, appInfo,
                     userId, ps);
         }
@@ -4871,6 +4887,7 @@ public class ComputerEngine implements Computer {
                             ps.getUserStateOrDefault(userId), userId, ps);
                     if (ai != null) {
                         ai.packageName = resolveExternalPackageName(ps.getPkg());
+                        stripXposedMetaData(ai, callingUid);
                     }
                 } else {
                     // Shared lib filtering done in generateApplicationInfoFromSettingsLPw
@@ -4902,6 +4919,7 @@ public class ComputerEngine implements Computer {
                         packageState.getUserStateOrDefault(userId), userId, packageState);
                 if (ai != null) {
                     ai.packageName = resolveExternalPackageName(pkg);
+                    stripXposedMetaData(ai, callingUid);
                     list.add(ai);
                 }
             }

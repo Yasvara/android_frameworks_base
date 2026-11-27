@@ -83,6 +83,21 @@ public final class ModuleLoader {
         }
     }
 
+    synchronized void pruneMissing() {
+        for (int i = mCache.size() - 1; i >= 0; i--) {
+            if (!new File(mCache.keyAt(i)).isFile()) {
+                mCache.removeAt(i);
+            }
+        }
+        synchronized (sProbeCache) {
+            for (int i = sProbeCache.size() - 1; i >= 0; i--) {
+                if (!new File(sProbeCache.keyAt(i)).isFile()) {
+                    sProbeCache.removeAt(i);
+                }
+            }
+        }
+    }
+
     synchronized Result load(String apkPath) {
         final File file = new File(apkPath);
         final long len = file.length();

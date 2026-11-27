@@ -131,7 +131,17 @@ public final class YasvaraSpoofProfiles {
 
     /** The profile assigned to this package, or null. */
     public static Profile profileFor(ContentResolver cr, String pkg) {
-        return find(cr, readJson(cr, KEY_APP_SPOOF_MAP).optString(pkg, null));
+        if (cr == null || TextUtils.isEmpty(pkg)) return null;
+        try {
+            final String raw = Settings.Secure.getString(cr, KEY_APP_SPOOF_MAP);
+            if (TextUtils.isEmpty(raw) || raw.length() <= 2 || !raw.contains(pkg)) {
+                return null;
+            }
+            return find(cr, new JSONObject(raw).optString(pkg, null));
+        } catch (Exception e) {
+            Log.w(TAG, "Bad " + KEY_APP_SPOOF_MAP, e);
+            return null;
+        }
     }
 
     /**

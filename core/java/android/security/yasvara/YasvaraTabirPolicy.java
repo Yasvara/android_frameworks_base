@@ -19,6 +19,9 @@ import java.util.Arrays;
 public final class YasvaraTabirPolicy {
     public static final int FIRST_APPLICATION_UID = 10000;
     public static final int LAST_APPLICATION_UID = 19999;
+    public static final int FIRST_ISOLATED_UID = 90000;
+    public static final int LAST_ISOLATED_UID = 99999;
+    public static final int PER_USER_RANGE = 100000;
 
     public static final int SCOPE_SELECTED = 0;
     public static final int SCOPE_ALL_USER_APPS = 1;
@@ -267,9 +270,20 @@ public final class YasvaraTabirPolicy {
         return mGlobalHiddenAppIds.size() + mGlobalHiddenRomPackages.size();
     }
 
+    private static int toAppId(int uidOrAppId) {
+        return uidOrAppId >= PER_USER_RANGE ? (uidOrAppId % PER_USER_RANGE) : uidOrAppId;
+    }
+
+    private static boolean isAppOrIsolated(int appId) {
+        return (appId >= FIRST_APPLICATION_UID && appId <= LAST_APPLICATION_UID)
+                || (appId >= FIRST_ISOLATED_UID && appId <= LAST_ISOLATED_UID);
+    }
+
     public boolean stripsXposedMetaData(int callingAppId, int targetAppId) {
         if (mXposedModuleAppIds.isEmpty()) return false;
-        if (callingAppId < FIRST_APPLICATION_UID || callingAppId > LAST_APPLICATION_UID) {
+        callingAppId = toAppId(callingAppId);
+        targetAppId = toAppId(targetAppId);
+        if (!isAppOrIsolated(callingAppId)) {
             return false;
         }
         if (callingAppId == targetAppId || !mXposedModuleAppIds.contains(targetAppId)) {
@@ -280,7 +294,9 @@ public final class YasvaraTabirPolicy {
 
     public boolean hidesUid(int callingAppId, int targetAppId) {
         if (mIsEmpty) return false;
-        if (callingAppId < FIRST_APPLICATION_UID || callingAppId > LAST_APPLICATION_UID) {
+        callingAppId = toAppId(callingAppId);
+        targetAppId = toAppId(targetAppId);
+        if (!isAppOrIsolated(callingAppId)) {
             return false;
         }
         if (targetAppId < FIRST_APPLICATION_UID || callingAppId == targetAppId) {
@@ -307,7 +323,9 @@ public final class YasvaraTabirPolicy {
 
     public boolean hidesPackage(int callingAppId, int targetAppId, String targetPkg) {
         if (mIsEmpty) return false;
-        if (callingAppId < FIRST_APPLICATION_UID || callingAppId > LAST_APPLICATION_UID) {
+        callingAppId = toAppId(callingAppId);
+        targetAppId = toAppId(targetAppId);
+        if (!isAppOrIsolated(callingAppId)) {
             return false;
         }
         if (callingAppId == targetAppId) {
@@ -366,7 +384,8 @@ public final class YasvaraTabirPolicy {
 
     public boolean concealsDevSettings(int callingAppId) {
         if (mDevHideMode == DEV_HIDE_OFF) return false;
-        if (callingAppId < FIRST_APPLICATION_UID || callingAppId > LAST_APPLICATION_UID) {
+        callingAppId = toAppId(callingAppId);
+        if (!isAppOrIsolated(callingAppId)) {
             return false;
         }
         if (mExemptCallers.contains(callingAppId)) return false;

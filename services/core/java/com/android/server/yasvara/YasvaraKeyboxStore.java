@@ -122,25 +122,43 @@ final class YasvaraKeyboxStore {
         }
     }
 
-    /** Derived, non-secret native configuration (e.g. "targets"), replaced atomically. */
+    /** Derived, non-secret native configuration (e.g. text configs), replaced atomically. */
     void publishConfig(String name, String content) throws IOException {
-        if (name.indexOf('/') >= 0 || name.startsWith(".")) {
+        publishBytes(name, content.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Derived binary snapshot (e.g. "policy.bin"), replaced atomically (0640 system:keystore). */
+    void publishBytes(String name, byte[] content) throws IOException {
+        if (name == null || name.isEmpty() || name.indexOf('/') >= 0 || name.startsWith(".")) {
             throw new IllegalArgumentException("bad config name");
         }
         publish(mDirectory.resolve(name), content, () -> { });
     }
 
-    private void publish(String xml, Runnable onCommitted) throws IOException {
-        publish(mCanonical, xml, onCommitted);
+    /** Deletes an obsolete derived config file if present (0 writes once removed). */
+    void deleteConfig(String name) {
+        if (name == null || name.isEmpty() || name.indexOf('/') >= 0 || name.startsWith(".")) {
+            return;
+        }
+        try {
+            if (mFiles.deleteIfExists(mDirectory.resolve(name))) {
+                mFiles.syncDirectory(mDirectory);
+            }
+        } catch (IOException ignored) {
+        }
     }
 
-    private void publish(Path target, String xml, Runnable onCommitted) throws IOException {
+    private void publish(String xml, Runnable onCommitted) throws IOException {
+        publish(mCanonical, xml.getBytes(StandardCharsets.UTF_8), onCommitted);
+    }
+
+    private void publish(Path target, byte[] bytes, Runnable onCommitted) throws IOException {
         requireDirectory();
         Path temporary = Files.createTempFile(mDirectory, ".keybox-", ".tmp",
                 PosixFilePermissions.asFileAttribute(PRIVATE_MODE));
         boolean committed = false;
         try {
-            mFiles.writeAndSync(temporary, xml.getBytes(StandardCharsets.UTF_8));
+            mFiles.writeAndSync(temporary, bytes);
             mFiles.replace(temporary, target);
             committed = true;
             // Publication is the commit point. Keep RAM coherent even if later fsync/cleanup fails.

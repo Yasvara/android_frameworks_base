@@ -1537,69 +1537,6 @@ uint32_t ResXMLParser::getAttributeNameResID(size_t idx) const
     return 0;
 }
 
-// Yasvara: Kait deterministic ResXML rewriting C-ABI helpers (avoids mangled symbol lookup
-// and ResXMLTree memory-offset scanning).
-uint32_t* ResXMLParser::kaitMutableAttrNameResIdSlot(int32_t nameId) const {
-    if (nameId >= 0 && static_cast<size_t>(nameId) < mTree.mNumResIds && mTree.mResIds != nullptr) {
-        return const_cast<uint32_t*>(&mTree.mResIds[nameId]);
-    }
-    return nullptr;
-}
-
-extern "C" {
-
-__attribute__((visibility("default")))
-int32_t yasvara_kait_xml_next(void* parser_ptr) {
-    auto* parser = static_cast<android::ResXMLParser*>(parser_ptr);
-    return parser ? static_cast<int32_t>(parser->next()) : android::ResXMLParser::BAD_DOCUMENT;
-}
-
-__attribute__((visibility("default")))
-void yasvara_kait_xml_restart(void* parser_ptr) {
-    if (auto* parser = static_cast<android::ResXMLParser*>(parser_ptr)) {
-        parser->restart();
-    }
-}
-
-__attribute__((visibility("default")))
-const void* yasvara_kait_xml_cur_ext(void* parser_ptr) {
-    auto* parser = static_cast<android::ResXMLParser*>(parser_ptr);
-    return parser ? parser->kaitCurrentExt() : nullptr;
-}
-
-__attribute__((visibility("default")))
-int32_t yasvara_kait_xml_attr_name_id(void* parser_ptr, size_t idx) {
-    auto* parser = static_cast<android::ResXMLParser*>(parser_ptr);
-    return parser ? parser->getAttributeNameID(idx) : -1;
-}
-
-__attribute__((visibility("default")))
-uint32_t yasvara_kait_xml_attr_name_res_id(void* parser_ptr, size_t idx) {
-    auto* parser = static_cast<android::ResXMLParser*>(parser_ptr);
-    return parser ? parser->getAttributeNameResID(idx) : 0;
-}
-
-__attribute__((visibility("default")))
-uint32_t* yasvara_kait_xml_mutable_attr_slot(void* parser_ptr, int32_t name_id) {
-    auto* parser = static_cast<android::ResXMLParser*>(parser_ptr);
-    return parser ? parser->kaitMutableAttrNameResIdSlot(name_id) : nullptr;
-}
-
-__attribute__((visibility("default")))
-const uint16_t* yasvara_kait_xml_attr_name_utf16(void* parser_ptr, int32_t name_id, size_t* out_len) {
-    auto* parser = static_cast<android::ResXMLParser*>(parser_ptr);
-    if (!parser || name_id < 0 || !out_len) return nullptr;
-    auto str = parser->getStrings().stringAt(static_cast<size_t>(name_id));
-    if (!str.has_value()) {
-        *out_len = 0;
-        return nullptr;
-    }
-    *out_len = str->size();
-    return reinterpret_cast<const uint16_t*>(str->data());
-}
-
-}  // extern "C"
-
 int32_t ResXMLParser::getAttributeValueStringID(size_t idx) const
 {
     if (mEventCode == START_TAG) {

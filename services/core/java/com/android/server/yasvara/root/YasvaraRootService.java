@@ -178,6 +178,7 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
     private final Context mContext;
     private final Handler mHandler = BackgroundThread.getHandler();
     private final Object mLock = new Object();
+    private static volatile YasvaraRootService sInstance;
     // uid -> grant, in insertion order
     private final LinkedHashMap<Integer, Grant> mGrants = new LinkedHashMap<>();
     private final LinkedHashMap<Integer, Denied> mDenied = new LinkedHashMap<>();
@@ -192,6 +193,7 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
 
     public YasvaraRootService(Context context) {
         mContext = context;
+        sInstance = this;
         synchronized (mLock) {
             if (!readFileLocked()) persistLocked();
         }
@@ -814,6 +816,96 @@ public final class YasvaraRootService extends IYasvaraRoot.Stub {
             Slog.w(TAG, "setZygiskConfigJson", e);
             return false;
         }
+    }
+
+    /**
+     * Merges Tabir's protected observer appIds into Akar's Zygisk DenyList and Force-Unmount
+     * tables (preserving manual entries via a `# tabir=` tracker comment). No-op when Akar
+     * config files do not exist or when the effective UID set is unchanged.
+     */
+    public static void syncTabirProtectedUids(int[] appIds) {
+        YasvaraRootService svc = sInstance;
+        if (svc == null) return;
+        svc.syncTabirProtectedUidsInternal(appIds);
+    }
+
+    private void syncTabirProtectedUidsInternal(int[] appIds) {
+        if (!ZYGISK_CONF_FILE.isFile() && !UNMOUNT_CONF_FILE.isFile()) return;
+        final java.util.TreeSet<Integer> nextTabir = new java.util.TreeSet<>();
+        if (appIds != null) {
+            for (int uid : appIds) {
+                if (uid >= Process.FIRST_APPLICATION_UID) nextTabir.add(uid);
+            }
+        }
+        synchronized (mLock) {
+            try {
+                if (ZYGISK_CONF_FILE.isFile()) {
+                    mergeTabirKeyIntoConf(ZYGISK_CONF_FILE, "denylist", nextTabir);
+                }
+                if (UNMOUNT_CONF_FILE.isFile()) {
+                    mergeTabirKeyIntoConf(UNMOUNT_CONF_FILE, "force", nextTabir);
+                }
+            } catch (Exception e) {
+                Slog.w(TAG, "syncTabirProtectedUids failed", e);
+            }
+        }
+    }
+
+    private static void mergeTabirKeyIntoConf(File file, String key,
+            java.util.TreeSet<Integer> nextTabir) throws IOException, ErrnoException {
+        List<String> lines = readLines(file);
+        if (lines.isEmpty()) return;
+        java.util.TreeSet<Integer> prevTabir = new java.util.TreeSet<>();
+        java.util.TreeSet<Integer> current = new java.util.TreeSet<>();
+        int keyIdx = -1;
+        int trackerIdx = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            String trimmed = lines.get(i).trim();
+            if (trimmed.startsWith("# tabir=")) {
+                trackerIdx = i;
+                parseIntCsv(trimmed.substring("# tabir=".length()), prevTabir);
+            } else if (trimmed.startsWith(key + "=")) {
+                keyIdx = i;
+                parseIntCsv(trimmed.substring(key.length() + 1), current);
+            }
+        }
+        java.util.TreeSet<Integer> merged = new java.util.TreeSet<>(current);
+        merged.removeAll(prevTabir);
+        merged.addAll(nextTabir);
+        if (merged.equals(current) && prevTabir.equals(nextTabir)) {
+            return;
+        }
+        String keyLine = key + "=" + joinIntSet(merged);
+        String trackerLine = "# tabir=" + joinIntSet(nextTabir);
+        ArrayList<String> out = new ArrayList<>(lines);
+        if (keyIdx >= 0) out.set(keyIdx, keyLine); else out.add(keyLine);
+        if (trackerIdx >= 0) out.set(trackerIdx, trackerLine); else out.add(trackerLine);
+        StringBuilder sb = new StringBuilder();
+        for (String l : out) sb.append(l).append('\n');
+        writeAtomicConf(file, sb.toString());
+    }
+
+    private static void parseIntCsv(String csv, java.util.Set<Integer> out) {
+        if (csv == null || csv.isEmpty()) return;
+        for (String tok : csv.split(",")) {
+            String s = tok.trim();
+            if (s.isEmpty()) continue;
+            try {
+                int v = Integer.parseInt(s);
+                if (v >= 0) out.add(v);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+    }
+
+    private static String joinIntSet(java.util.Set<Integer> values) {
+        if (values.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (Integer v : values) {
+            if (sb.length() > 0) sb.append(',');
+            sb.append(v);
+        }
+        return sb.toString();
     }
 
     private static String joinIntArray(org.json.JSONArray arr) {
