@@ -61,15 +61,15 @@ import java.util.Map;
 public final class YasvaraSpoofEngine {
     private static final String TAG = "YasvaraSpoof";
 
-    // Settings.Secure keys (string literals: readable from any app process).
-    static final String KEY_PIF_ENABLED = "yasvara_pif_enabled";
-    static final String KEY_PIF_CONFIG = "yasvara_pif_config";
-    static final String KEY_SPOOF_MODE = "yasvara_spoof_mode";
-    static final String KEY_PHOTOS_SPOOF = "yasvara_photos_spoof";
-    static final String KEY_SNAP_SPOOF = "yasvara_snap_spoof";
-    static final String KEY_KEYBOX_STAMP = "yasvara_keybox_stamp";
-    static final String KEY_RKP_MANUFACTURER = "yasvara_rkp_manufacturer";
-    static final String KEY_PATCH_OVERRIDE = "yasvara_trickystore_patch_override";
+    // Settings.Secure keys & package names sourced from Rust-generated YasvaraIntegrityContract.
+    static final String KEY_PIF_ENABLED = YasvaraIntegrityContract.SECURE_PIF_ENABLED;
+    static final String KEY_PIF_CONFIG = YasvaraIntegrityContract.SECURE_PIF_CONFIG;
+    static final String KEY_SPOOF_MODE = YasvaraIntegrityContract.SECURE_SPOOF_MODE;
+    static final String KEY_PHOTOS_SPOOF = YasvaraIntegrityContract.SECURE_PHOTOS_SPOOF;
+    static final String KEY_SNAP_SPOOF = YasvaraIntegrityContract.SECURE_SNAP_SPOOF;
+    static final String KEY_KEYBOX_STAMP = YasvaraIntegrityContract.SECURE_KEYBOX_STAMP;
+    static final String KEY_RKP_MANUFACTURER = YasvaraIntegrityContract.SECURE_RKP_MANUFACTURER;
+    static final String KEY_PATCH_OVERRIDE = YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE;
     private static final String DG_STAMP_FILE = ".yasvara_dg_stamp";
 
     /** 0 = auto, 1 = full fingerprint, 2 = model-only (Widevine-safe). */
@@ -77,21 +77,17 @@ public final class YasvaraSpoofEngine {
     static final int MODE_FULL = 1;
     static final int MODE_MODEL_ONLY = 2;
 
-    public static final String PKG_GMS = "com.google.android.gms";
-    public static final String PKG_GSF = "com.google.android.gsf";
-    private static final String PROC_GMS_UNSTABLE = PKG_GMS + ".unstable";
-    public static final String PKG_VENDING = "com.android.vending";
-    private static final String PKG_PHOTOS = "com.google.android.apps.photos";
-    private static final String PKG_SNAPCHAT = "com.snapchat.android";
-    private static final String PKG_SI = "com.google.android.settings.intelligence";
-    private static final String PKG_RKPD = "com.android.rkpdapp";
+    public static final String PKG_GMS = YasvaraIntegrityContract.PKG_GMS;
+    public static final String PKG_GSF = YasvaraIntegrityContract.PKG_GSF;
+    private static final String PROC_GMS_UNSTABLE = YasvaraIntegrityContract.PROC_GMS_UNSTABLE;
+    public static final String PKG_VENDING = YasvaraIntegrityContract.PKG_VENDING;
+    private static final String PKG_PHOTOS = YasvaraIntegrityContract.PKG_PHOTOS;
+    private static final String PKG_SNAPCHAT = YasvaraIntegrityContract.PKG_SNAPCHAT;
+    private static final String PKG_SI = YasvaraIntegrityContract.PKG_SI;
+    private static final String PKG_RKPD = YasvaraIntegrityContract.PKG_RKPD;
 
-    private static final String[] CAMERA_EXEMPT_PREFIX = {
-        "com.android.camera",
-        "com.google.android.GoogleCamera",
-        "com.google.android.cameralite",
-        "com.google.android.apps.cameralite",
-    };
+    private static final String[] CAMERA_EXEMPT_PREFIX =
+            YasvaraIntegrityContract.CAMERA_EXEMPT_PREFIXES;
 
     /** Fields safe for model-only spoofing (keeps native FINGERPRINT -> Widevine L1). */
     private static final String[] MODEL_ONLY_KEYS = {
@@ -286,12 +282,6 @@ public final class YasvaraSpoofEngine {
      * through to native readers; Java never substitutes a boot claim or caches a digest.
      * Called from {@code SystemProperties.get*}.
      */
-    /** True if the package receives full PIF spoofing (GMS, GSF, Play Store, Laras self-test). */
-    public static boolean isCollectorPackage(String pkg) {
-        return PKG_GMS.equals(pkg) || PKG_GSF.equals(pkg)
-                || PKG_VENDING.equals(pkg) || YasvaraUpdatePolicy.LARAS_PACKAGE.equals(pkg);
-    }
-
     public static String mapProp(String key) {
         try {
             if (key == null || !key.startsWith("ro.")) return null;
@@ -525,12 +515,13 @@ public final class YasvaraSpoofEngine {
             String tsTargets = Settings.Secure.getString(cr, YasvaraTrickyStore.KEY_TARGETS);
             String patchOverride = Settings.Secure.getString(cr, KEY_PATCH_OVERRIDE);
             String kbStamp = Settings.Secure.getString(cr, KEY_KEYBOX_STAMP);
+            int purgeGen = getInt(context, YasvaraIntegrityContract.SECURE_INTEGRITY_PURGE_GEN, 0);
             String bootDigest = readCanonicalBootDigest();
             String kernelRelease = readKernelRelease();
 
             String currentStamp = computeDroidGuardStamp(
                     pifEnabled, pif, tsEnabled, tsTargets, patchOverride,
-                    kbStamp, bootDigest, kernelRelease);
+                    kbStamp, bootDigest, kernelRelease, purgeGen, Build.TIME);
 
             File dataDir = context.getDataDir();
             if (dataDir == null) return;
@@ -578,8 +569,10 @@ public final class YasvaraSpoofEngine {
             String patchOverride,
             String kbStamp,
             String bootDigest,
-            String kernelRelease) {
-        StringBuilder state = new StringBuilder(448);
+            String kernelRelease,
+            int purgeGen,
+            long buildTime) {
+        StringBuilder state = new StringBuilder(512);
         state.append("pif=").append(pifEnabled ? "1" : "0")
              .append("|fp=").append(pif != null ? pif.getOrDefault("FINGERPRINT", "") : "")
              .append("|sp=").append(pif != null ? pif.getOrDefault("SECURITY_PATCH", "") : "")
@@ -594,7 +587,9 @@ public final class YasvaraSpoofEngine {
              .append("|po=").append(patchOverride != null ? patchOverride : "")
              .append("|kb=").append(kbStamp != null ? kbStamp : "")
              .append("|bd=").append(bootDigest != null ? bootDigest : "")
-             .append("|kr=").append(kernelRelease != null ? kernelRelease : "");
+             .append("|kr=").append(kernelRelease != null ? kernelRelease : "")
+             .append("|pg=").append(purgeGen)
+             .append("|bt=").append(buildTime);
         return Integer.toHexString(state.toString().hashCode());
     }
 
@@ -671,56 +666,46 @@ public final class YasvaraSpoofEngine {
         file.delete();
     }
 
-    /** True when PIF spoofing is enabled in Settings.Secure or vendor persist properties. */
+    /**
+     * Authoritative PIF gate shared with Rust `keystore2` and Bionic `libc.so`.
+     * Honors `persist.sys.yasvara.pif.enabled` staged by `YasvaraAttestationService`
+     * (which becomes `"0"` when user disables PIF or an Akar module claims `play_integrity`).
+     */
     public static boolean isPifEnabled(Context ctx) {
-        if (ctx != null) {
-            return getInt(ctx, KEY_PIF_ENABLED, 1) == 1;
+        try {
+            String staged = SystemProperties.get(YasvaraIntegrityContract.PROP_PIF_ENABLED, "").trim();
+            if ("0".equals(staged) || "false".equalsIgnoreCase(staged)) return false;
+            if ("1".equals(staged) || "true".equalsIgnoreCase(staged)) return true;
+        } catch (Throwable ignored) {
         }
-        return SystemProperties.getInt("persist.sys.yasvara.pif", 1) == 1;
+        if (ctx != null) {
+            return getInt(ctx, KEY_PIF_ENABLED, 0) == 1;
+        }
+        return false;
     }
 
-    /** Reads the PIF JSON ({FINGERPRINT, MODEL, SECURITY_PATCH, ...}) from Secure, fallback, or staged persist props. */
+    /**
+     * Reads the active normalized PIF profile. Fast-path reads the Rust-normalized
+     * `persist.sys.yasvara.pif.*` staging properties (zero JSON parsing on GMS cold start),
+     * falling back to `Settings.Secure` / fallback JSON only if staging is absent.
+     */
     public static Map<String, String> getPifConfig(Context ctx) {
         try {
-            String raw = null;
-            boolean settingsReadable = true;
+            Map<String, String> staged = readStagedPif();
+            if (!staged.isEmpty()) {
+                return staged;
+            }
             if (ctx != null) {
                 try {
-                    raw = Settings.Secure.getString(ctx.getContentResolver(), KEY_PIF_CONFIG);
-                } catch (Throwable t) {
-                    settingsReadable = false;
-                }
-            } else {
-                settingsReadable = false;
-            }
-            if (!TextUtils.isEmpty(raw)) {
-                Map<String, String> out = parseAndNormalizePifJson(raw);
-                return (out == null || out.isEmpty()) ? null : out;
-            }
-
-            if (!settingsReadable) {
-                Map<String, String> staged = new HashMap<>();
-                putPropIfAbsent(staged, "BRAND", "persist.sys.yasvara.pif.brand");
-                putPropIfAbsent(staged, "DEVICE", "persist.sys.yasvara.pif.device");
-                putPropIfAbsent(staged, "FINGERPRINT", "persist.sys.yasvara.pif.fingerprint");
-                putPropIfAbsent(staged, "ID", "persist.sys.yasvara.pif.build_id");
-                putPropIfAbsent(staged, "MANUFACTURER", "persist.sys.yasvara.pif.manufacturer");
-                putPropIfAbsent(staged, "MODEL", "persist.sys.yasvara.pif.model");
-                putPropIfAbsent(staged, "PRODUCT", "persist.sys.yasvara.pif.name");
-                putPropIfAbsent(staged, "SECURITY_PATCH", "persist.sys.yasvara.pif.security_patch");
-                putPropIfAbsent(staged, "DEVICE_INITIAL_SDK_INT", "persist.sys.yasvara.pif.first_api_level");
-                putPropIfAbsent(staged, "TYPE", "persist.sys.yasvara.pif.build_type");
-                putPropIfAbsent(staged, "TAGS", "persist.sys.yasvara.pif.build_tags");
-                putPropIfAbsent(staged, "RELEASE", "persist.sys.yasvara.pif.release");
-                putPropIfAbsent(staged, "INCREMENTAL", "persist.sys.yasvara.pif.incremental");
-                putPropIfAbsent(staged, "BOARD_API_LEVEL", "persist.sys.yasvara.pif.api_level");
-                deriveFieldsFromFingerprint(staged);
-                if (!staged.isEmpty()) {
-                    return staged;
+                    String raw = Settings.Secure.getString(ctx.getContentResolver(), KEY_PIF_CONFIG);
+                    if (!TextUtils.isEmpty(raw)) {
+                        Map<String, String> out = parseAndNormalizePifJson(raw);
+                        if (out != null && !out.isEmpty()) return out;
+                    }
+                } catch (Throwable ignored) {
                 }
             }
-
-            raw = readFallback();
+            String raw = readFallback();
             if (!TextUtils.isEmpty(raw)) {
                 Map<String, String> out = parseAndNormalizePifJson(raw);
                 return (out == null || out.isEmpty()) ? null : out;
@@ -729,6 +714,38 @@ public final class YasvaraSpoofEngine {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    private static Map<String, String> readStagedPif() {
+        Map<String, String> staged = new HashMap<>();
+        final String p = YasvaraIntegrityContract.PROP_PIF_PREFIX;
+        putPropIfAbsent(staged, "BRAND", p + "brand");
+        putPropIfAbsent(staged, "DEVICE", p + "device");
+        putPropIfAbsent(staged, "FINGERPRINT", p + "fingerprint");
+        putPropIfAbsent(staged, "ID", p + "build_id");
+        putPropIfAbsent(staged, "MANUFACTURER", p + "manufacturer");
+        putPropIfAbsent(staged, "MODEL", p + "model");
+        putPropIfAbsent(staged, "PRODUCT", p + "name");
+        putPropIfAbsent(staged, "SECURITY_PATCH", p + "security_patch");
+        putPropIfAbsent(staged, "DEVICE_INITIAL_SDK_INT", p + "first_api_level");
+        putPropIfAbsent(staged, "TYPE", p + "build_type");
+        putPropIfAbsent(staged, "TAGS", p + "build_tags");
+        putPropIfAbsent(staged, "RELEASE", p + "release");
+        putPropIfAbsent(staged, "INCREMENTAL", p + "incremental");
+        putPropIfAbsent(staged, "BOARD_API_LEVEL", p + "api_level");
+        // Reassemble >91B fingerprint from Rust-staged components when omitted from single prop.
+        if (!staged.containsKey("FINGERPRINT")
+                && staged.containsKey("BRAND") && staged.containsKey("PRODUCT")
+                && staged.containsKey("DEVICE") && staged.containsKey("RELEASE")
+                && staged.containsKey("ID") && staged.containsKey("INCREMENTAL")
+                && staged.containsKey("TYPE") && staged.containsKey("TAGS")) {
+            staged.put("FINGERPRINT",
+                    staged.get("BRAND") + "/" + staged.get("PRODUCT") + "/" + staged.get("DEVICE")
+                            + ":" + staged.get("RELEASE") + "/" + staged.get("ID") + "/"
+                            + staged.get("INCREMENTAL") + ":" + staged.get("TYPE") + "/"
+                            + staged.get("TAGS"));
+        }
+        return staged;
     }
 
     /** Parses PIF JSON, derives Build fields from FINGERPRINT before fallback defaults, and normalizes SDK fields. */
@@ -802,37 +819,6 @@ public final class YasvaraSpoofEngine {
         return "";
     }
 
-    /**
-     * Resolves KeyMint TAG_OS_VERSION (tag 705) from a PIF profile map.
-     * Matches keystore2/src/yasvara/mod.rs logic for parity on Canary and Trunk Stable builds.
-     */
-    public static int resolvePifOsVersion(Map<String, String> pif) {
-        return resolvePifOsVersion(pif, PLATFORM_RELEASE);
-    }
-
-    /**
-     * As {@link #resolvePifOsVersion(Map)}. When FINGERPRINT carries a codename release
-     * segment (":CANARY/"), a missing, codename or stale RELEASE (e.g. "16" cached before the
-     * device moved to Android 17) is healed via {@link #inferReleaseFromFingerprintOrPlatform}.
-     */
-    static int resolvePifOsVersion(Map<String, String> pif, String platformRelease) {
-        if (pif == null || pif.isEmpty()) return -1;
-        String healed = healedCodenameRelease(pif.get("FINGERPRINT"), pif.get("RELEASE"),
-                pif.get("ID"), platformRelease);
-        if (healed != null) {
-            Integer healedVer = parseVersionNumber(healed);
-            if (healedVer != null) return healedVer;
-        }
-        Integer relVer = parseVersionNumber(pif.get("RELEASE"));
-        if (relVer != null) return relVer;
-
-        Integer buildIdVer = inferVersionFromBuildId(pif.get("ID"));
-        if (buildIdVer != null) return buildIdVer;
-
-        // Pure codenames without numeric info default to 0 (AOSP Keymaster).
-        return 0;
-    }
-
     /** Parses numeric release string ("16", "16.1", "14.0.1") -> major*10000 + minor*100 + sub. */
     public static Integer parseVersionNumber(String rel) {
         if (rel == null) return null;
@@ -897,10 +883,6 @@ public final class YasvaraSpoofEngine {
      * Prevents GMS/DroidGuard cant.java from cross-checking a user/release-keys fingerprint
      * against a userdebug/test-keys Build.TYPE/TAGS.
      */
-    private static void deriveFieldsFromFingerprint(Map<String, String> out) {
-        deriveFieldsFromFingerprint(out, PLATFORM_RELEASE);
-    }
-
     private static void deriveFieldsFromFingerprint(Map<String, String> out,
             String platformRelease) {
         String fp = out.get("FINGERPRINT");
@@ -1035,16 +1017,18 @@ public final class YasvaraSpoofEngine {
     }
 
     private static String persistFor(String key) {
-        if (KEY_PIF_ENABLED.equals(key)) return "persist.sys.yasvara.pif";
-        if (KEY_PHOTOS_SPOOF.equals(key)) return "persist.sys.yasvara.photos_spoof";
-        if (KEY_SNAP_SPOOF.equals(key)) return "persist.sys.yasvara.snap_spoof";
-        if (YasvaraTrickyStore.KEY_ENABLED.equals(key)) return "persist.sys.yasvara.trickystore";
+        if (KEY_PIF_ENABLED.equals(key)) return YasvaraIntegrityContract.PROP_PIF_ENABLED;
+        if (KEY_PHOTOS_SPOOF.equals(key)) return YasvaraIntegrityContract.PROP_PHOTOS_SPOOF;
+        if (KEY_SNAP_SPOOF.equals(key)) return YasvaraIntegrityContract.PROP_SNAP_SPOOF;
+        if (YasvaraTrickyStore.KEY_ENABLED.equals(key)) {
+            return YasvaraIntegrityContract.PROP_TRICKY_ENABLED;
+        }
         return null;
     }
 
     private static String readFallback() {
         try (BufferedReader r = new BufferedReader(
-                new FileReader("/product/etc/yasvara/pif_fallback.json"))) {
+                new FileReader(YasvaraIntegrityContract.PIF_FALLBACK_PATH))) {
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = r.readLine()) != null) {

@@ -161,7 +161,6 @@ public class KeyStore2 {
 
     void delete(KeyDescriptor descriptor) throws KeyStoreException {
         StrictMode.noteDiskWrite();
-        android.security.yasvara.YasvaraTrickyStore.onDeleteKey(descriptor);
 
         handleRemoteExceptionWithRetry((service) -> {
             service.deleteKey(descriptor);
@@ -283,11 +282,6 @@ public class KeyStore2 {
     public KeyEntryResponse getKeyEntry(@NonNull KeyDescriptor descriptor)
             throws KeyStoreException {
         StrictMode.noteDiskRead();
-
-        KeyEntryResponse spoofed = android.security.yasvara.YasvaraTrickyStore.onGetKeyEntry(descriptor);
-        if (spoofed != null) {
-            return spoofed;
-        }
 
         return handleRemoteExceptionWithRetry((service) -> service.getKeyEntry(descriptor));
     }

@@ -165,26 +165,9 @@ public class KeyStoreSecurityLevel {
             Collection<KeyParameter> args, int flags, byte[] entropy)
             throws KeyStoreException {
         StrictMode.noteDiskWrite();
-        try {
-            return retryBusyException(() -> mSecurityLevel.generateKey(
-                    descriptor, attestationKey, args.toArray(new KeyParameter[args.size()]),
-                    flags, entropy));
-        } catch (KeyStoreException e) {
-            if (attestationKey == null && shouldSynthesizeOnError(e.getErrorCode())) {
-                KeyMetadata metadata = android.security.yasvara.YasvaraTrickyStore.onGenerateKey(
-                        mSecurityLevel, descriptor, args, flags, entropy);
-                if (metadata != null) {
-                    return metadata;
-                }
-            }
-            throw e;
-        }
-    }
-
-    private static boolean shouldSynthesizeOnError(int errorCode) {
-        return errorCode == -66 /* CANNOT_ATTEST_IDS */
-                || errorCode == -74 /* ATTESTATION_KEYS_NOT_PROVISIONED */
-                || errorCode == -75 /* ATTESTATION_IDS_NOT_PROVISIONED */;
+        return retryBusyException(() -> mSecurityLevel.generateKey(
+                descriptor, attestationKey, args.toArray(new KeyParameter[args.size()]),
+                flags, entropy));
     }
 
     /**

@@ -29,6 +29,7 @@ filegroup {
         ":systemfeatures-gen-srcs",
         ":framework-network-security-config-sources",
         ":GeneratedPolicyMetadata",
+        ":yasvara_integrity_contract_java",
     ],
     // Exactly one MessageQueue.java will be added to srcs by messagequeue-gen
     exclude_srcs: [

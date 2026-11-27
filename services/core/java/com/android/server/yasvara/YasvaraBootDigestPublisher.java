@@ -15,29 +15,28 @@ import android.os.UserHandle;
 import android.os.UserManager;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
-import android.security.yasvara.YasvaraAttestation;
 import android.security.yasvara.YasvaraBootDigest;
+import android.security.yasvara.YasvaraIntegrityContract;
 import android.util.Slog;
-
-import com.android.internal.org.bouncycastle.asn1.ASN1Enumerated;
 
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
-import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 
-/** Publishes a nonpersistent boot measurement; never runs on the system-server main thread. */
+/**
+ * Publishes the canonical immutable per-boot measurement (`ro.yasvara.boot.digest`).
+ * Delegates certificate chain signature/challenge/RootOfTrust validation and digest selection
+ * to Rust (`YasvaraIntegrityNative`) — zero BouncyCastle and immune to pre-NTP RTC clock skew.
+ */
 final class YasvaraBootDigestPublisher {
     private static final String TAG = "YasvaraBootDigest";
     private static final int MAX_ATTEMPTS = 3;
     private static final long RETRY_MS = 5_000;
 
     private final Context mContext;
+    private final Runnable mOnPublished;
     private final HandlerThread mThread = new HandlerThread(TAG);
     private Handler mHandler;
     private int mAttempts;
@@ -45,13 +44,13 @@ final class YasvaraBootDigestPublisher {
     private boolean mStopped;
     private boolean mUserUnlocked;
 
-    private YasvaraBootDigestPublisher(Context context) {
+    private YasvaraBootDigestPublisher(Context context, Runnable onPublished) {
         mContext = context;
+        mOnPublished = onPublished;
     }
 
-    /** Call only after ActivityManager/SettingsProvider are available. */
-    static void start(Context context) {
-        YasvaraBootDigestPublisher publisher = new YasvaraBootDigestPublisher(context);
+    static void start(Context context, Runnable onPublished) {
+        YasvaraBootDigestPublisher publisher = new YasvaraBootDigestPublisher(context, onPublished);
         publisher.mThread.start();
         publisher.mHandler = new Handler(publisher.mThread.getLooper());
         publisher.mHandler.post(publisher::startOnWorker);
@@ -80,7 +79,7 @@ final class YasvaraBootDigestPublisher {
             UserManager users = mContext.getSystemService(UserManager.class);
             mUserUnlocked = users != null && users.isUserUnlocked(UserHandle.SYSTEM);
         } catch (RuntimeException e) {
-            Slog.w(TAG, "Cannot query unlock state; retaining the unlock receiver", e);
+            Slog.w(TAG, "Cannot query unlock state; retaining unlock receiver", e);
         }
         mAttempt.run();
     }
@@ -88,7 +87,7 @@ final class YasvaraBootDigestPublisher {
     private final Runnable mAttempt = new Runnable() {
         @Override public void run() {
             if (mStopped) return;
-            String existing = SystemProperties.get(YasvaraBootDigest.PROPERTY, "");
+            String existing = SystemProperties.get(YasvaraIntegrityContract.PROP_BOOT_DIGEST, "");
             if (!existing.isEmpty()) {
                 if (YasvaraBootDigest.decodeCanonical(existing) == null) {
                     Slog.e(TAG, "Invalid immutable boot digest; leaving hardware attestation intact");
@@ -97,32 +96,42 @@ final class YasvaraBootDigestPublisher {
                 return;
             }
             mAttempts++;
-            String bootloader = SystemProperties.get("ro.boot.vbmeta.digest", "");
+            String bootloader = SystemProperties.get(
+                    YasvaraIntegrityContract.PROP_BOOT_VBMETA_DIGEST, "");
             byte[] attested = captureHardwareHash();
-            YasvaraBootDigest.Selection selection = YasvaraBootDigest.select(bootloader, attested);
-            if (selection == null && YasvaraBootDigest.normalize(bootloader) != null
-                    && YasvaraBootDigest.encode(attested) != null) {
+            String[] result = YasvaraIntegrityNative.nativeSelectBootDigest(bootloader, attested);
+            if (result != null && result.length == 1 && "CONFLICT".equals(result[0])) {
                 Slog.e(TAG, "Bootloader and hardware-attested boot hashes disagree; not publishing");
                 finish();
                 return;
             }
-            if (selection != null) {
+            if (result != null && result.length == 2) {
+                String digest = result[0];
+                String selectedSource = result[1];
                 try {
-                    // Publish metadata first; the immutable digest is the readiness marker.
-                    String source = SystemProperties.get(YasvaraBootDigest.SOURCE_PROPERTY, "");
+                    String source = SystemProperties.get(
+                            YasvaraIntegrityContract.PROP_BOOT_SOURCE, "");
                     if (source.isEmpty()) {
-                        SystemProperties.set(YasvaraBootDigest.SOURCE_PROPERTY, selection.source);
-                    } else if (!source.equals(selection.source)) {
-                        Slog.e(TAG, "Incomplete boot publication has different provenance; not publishing");
+                        SystemProperties.set(
+                                YasvaraIntegrityContract.PROP_BOOT_SOURCE, selectedSource);
+                    } else if (!source.equals(selectedSource)) {
+                        Slog.e(TAG, "Incomplete boot publication has different provenance; aborting");
                         finish();
                         return;
                     }
-                    SystemProperties.set(YasvaraBootDigest.PROPERTY, selection.digest);
-                    Slog.i(TAG, "Published measured boot digest from " + selection.source);
+                    SystemProperties.set(YasvaraIntegrityContract.PROP_BOOT_DIGEST, digest);
+                    Slog.i(TAG, "Published measured boot digest from " + selectedSource);
+                    if (mOnPublished != null) {
+                        try {
+                            mOnPublished.run();
+                        } catch (Throwable t) {
+                            Slog.w(TAG, "onPublished callback failed", t);
+                        }
+                    }
                     finish();
                     return;
                 } catch (RuntimeException e) {
-                    Slog.w(TAG, "Cannot publish boot digest; check property context/permissions", e);
+                    Slog.w(TAG, "Cannot publish boot digest; check property permissions", e);
                 }
             }
             if (mAttempts < MAX_ATTEMPTS) {
@@ -143,8 +152,8 @@ final class YasvaraBootDigestPublisher {
             store.load(null);
             byte[] challenge = new byte[32];
             new SecureRandom().nextBytes(challenge);
-            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(YasvaraBootDigest.PROBE_ALIAS,
-                    KeyProperties.PURPOSE_SIGN)
+            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(
+                    YasvaraIntegrityContract.BOOT_DIGEST_PROBE_ALIAS, KeyProperties.PURPOSE_SIGN)
                     .setAlgorithmParameterSpec(new ECGenParameterSpec("secp256r1"))
                     .setDigests(KeyProperties.DIGEST_SHA256)
                     .setAttestationChallenge(challenge)
@@ -153,42 +162,28 @@ final class YasvaraBootDigestPublisher {
                     KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore");
             generator.initialize(spec);
             generator.generateKeyPair();
-            Certificate[] chain = store.getCertificateChain(YasvaraBootDigest.PROBE_ALIAS);
-            if (chain == null || chain.length < 2 || !(chain[0] instanceof X509Certificate)) {
+            Certificate[] chain = store.getCertificateChain(
+                    YasvaraIntegrityContract.BOOT_DIGEST_PROBE_ALIAS);
+            if (chain == null || chain.length < 2) {
                 return null;
             }
-            YasvaraAttestation.Record record = YasvaraAttestation.parse((X509Certificate) chain[0]);
-            if (record == null || !Arrays.equals(challenge, record.challenge)
-                    || !hardwareLevel(record, 1) || !hardwareLevel(record, 3)
-                    || record.deviceLocked == null || record.verifiedBootState == null
-                    || record.verifiedBootState < 0 || record.verifiedBootState > 3) return null;
-            List<X509Certificate> certificates = new ArrayList<>(chain.length);
-            for (Certificate certificate : chain) {
-                if (!(certificate instanceof X509Certificate)) return null;
-                X509Certificate x509 = (X509Certificate) certificate;
-                x509.checkValidity();
-                certificates.add(x509);
+            byte[][] derChain = new byte[chain.length][];
+            for (int i = 0; i < chain.length; i++) {
+                derChain[i] = chain[i].getEncoded();
             }
-            if (!YasvaraAttestation.chainSignaturesValid(certificates)) return null;
-            return YasvaraBootDigest.encode(record.verifiedBootHash) == null
-                    ? null : record.verifiedBootHash.clone();
+            return YasvaraIntegrityNative.nativeExtractHardwareBootHash(derChain, challenge);
         } catch (Exception e) {
             Slog.w(TAG, "Hardware boot measurement not available", e);
             return null;
         } finally {
             if (store != null) {
                 try {
-                    store.deleteEntry(YasvaraBootDigest.PROBE_ALIAS);
+                    store.deleteEntry(YasvaraIntegrityContract.BOOT_DIGEST_PROBE_ALIAS);
                 } catch (Exception e) {
                     Slog.w(TAG, "Cannot delete temporary boot-attestation key", e);
                 }
             }
         }
-    }
-
-    private static boolean hardwareLevel(YasvaraAttestation.Record record, int index) {
-        int level = ASN1Enumerated.getInstance(record.keyDescription[index]).intValueExact();
-        return level == 1 || level == 2;
     }
 
     private void finish() {

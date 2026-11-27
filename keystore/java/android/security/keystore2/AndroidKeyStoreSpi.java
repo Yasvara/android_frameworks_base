@@ -221,14 +221,6 @@ public class AndroidKeyStoreSpi extends KeyStoreSpi {
         }
 
         caList[0] = leaf;
-
-        try {
-            // Yasvara: built-in TrickyStore chain rewrite for target apps.
-            java.security.cert.Certificate[] spoofed =
-                    android.security.yasvara.YasvaraTrickyStore.maybeSpoofChain(caList, alias);
-            if (spoofed != null) return spoofed;
-        } catch (Throwable ignored) {
-        }
         return caList;
     }
 

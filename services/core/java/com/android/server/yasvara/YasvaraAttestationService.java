@@ -10,6 +10,7 @@ import android.content.pm.PackageManager;
 import android.database.ContentObserver;
 import android.net.Uri;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
@@ -17,117 +18,70 @@ import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.provider.Settings;
 import android.security.yasvara.IYasvaraAttestation;
-import android.security.yasvara.YasvaraKeySynthesizer;
-import android.security.yasvara.YasvaraKeyboxProvider;
-import android.security.yasvara.YasvaraLadder;
-import android.security.yasvara.YasvaraServiceClient;
-import android.security.yasvara.YasvaraSpoofEngine;
+import android.security.yasvara.YasvaraIntegrityContract;
 import android.security.yasvara.YasvaraTrickyStore;
 import android.util.ArrayMap;
 import android.util.ArraySet;
-import android.util.Base64;
-import android.util.Log;
 import android.util.Slog;
 
-import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.cert.Certificate;
-import java.security.cert.CertificateFactory;
-import java.security.cert.X509Certificate;
-import java.util.ArrayList;
+import java.nio.file.Files;
 import java.util.Collection;
 import java.util.List;
-import java.util.Map;
 
 /**
- * System-side attestation protection, running in system_server.
+ * Thin system_server Binder & lifecycle shim for Yasvara integrity.
  *
- * <p>Publishes the keybox in {@code /data/misc/yasvara_attest/keybox.xml} (0640,
- * system:keystore), shared read-only with keystore2 under a dedicated SELinux label.
- * Init owns directory setup; the service never accesses keystore2's database directory.
- * Target processes send only their public chain; the ladder runs here and the rewritten
- * chain comes back. This service never publishes private material to Settings.Secure.
- *
- * <p>Reads are open to any caller (every target app needs them); writes require
- * {@code yasvara.permission.WRITE_ATTESTATION} (Laras, platform-signed + allowlisted).
+ * <p>Delegates all cryptographic keybox parsing/validation, RKP CBOR extraction, PIF normalization,
+ * and patch-override parsing to Rust (`libyasvara_integrity_jni`). Publishes canonical files in
+ * `/data/misc/yasvara_attest/` (0640, system:keystore) for `keystore2` and stages normalized
+ * `persist.sys.yasvara.pif.*` properties for Bionic `libc.so` and collector processes.
  *
  * @hide
  */
 public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
     private static final String TAG = "YasvaraAttestation";
-
-    static final String PERMISSION_WRITE = "yasvara.permission.WRITE_ATTESTATION";
-
-    private static final int MAX_CHAIN_BYTES = 64 * 1024;
-    /** Upper bound on one restartPackages() call; Laras sends a handful. */
     private static final int MAX_RESTART_PACKAGES = 64;
+    private static final File AKAR_MANAGED_FEATURES_FILE =
+            new File(YasvaraIntegrityContract.AKAR_MANAGED_FEATURES_PATH);
+    private static final File PIF_FALLBACK_FILE =
+            new File(YasvaraIntegrityContract.PIF_FALLBACK_PATH);
 
-    /** The one active PIF profile. Everything else is derived from this. */
-    private static final String PIF_CONFIG_KEY = "yasvara_pif_config";
-    /** User toggle gating whether PIF identity spoofing is active (default 0 = off). */
-    private static final String PIF_ENABLED_KEY = "yasvara_pif_enabled";
-    /** Optional global/per-app security patch override JSON ({pkg|"*": "YYYY-MM-DD"}). */
-    private static final String PATCH_OVERRIDE_KEY = "yasvara_trickystore_patch_override";
-    /** Keybox change stamp observed by DroidGuard cache invalidation. */
-    private static final String KEYBOX_STAMP_KEY = "yasvara_keybox_stamp";
-    /** RKP ProvisioningInfo manufacturer (CBOR key 3) extracted from the active keybox. */
-    private static final String RKP_MANUFACTURER_KEY = "yasvara_rkp_manufacturer";
-    /** Native property mirroring RKP manufacturer for Bionic libc and early readers. */
-    private static final String NATIVE_RKP_MANUFACTURER_PROPERTY =
-            "persist.sys.yasvara.rkp_manufacturer";
-    /** Rung telemetry key in Settings.Secure. */
-    private static final String RUNG_KEY = "yasvara_trickystore_rung";
+    static final String PERMISSION_WRITE = YasvaraIntegrityContract.PERMISSION_WRITE;
 
-    /** Staging prefix the native libc hook reads; one source, never hand-edited. */
-    private static final String NATIVE_PIF_PREFIX = "persist.sys.yasvara.pif.";
-    /** Explicit master PIF enabled switch read by keystore2 for true pass-through arbitration. */
-    private static final String NATIVE_PIF_ENABLED_PROPERTY = "persist.sys.yasvara.pif.enabled";
-    /** File published by yasvara_rootd listing active `manage.<feature>` claims by Akar modules. */
-    private static final java.io.File AKAR_MANAGED_FEATURES_FILE =
-            new java.io.File("/data/misc/yasvara_root/managed_features");
-    /** Master switch mirrored for keystore2; Settings stays the only input. */
-    private static final String NATIVE_ENABLED_PROPERTY = "persist.sys.yasvara.trickystore";
-    /** Optional global security patch override mirrored for keystore2. */
-    private static final String NATIVE_PATCH_OVERRIDE_PROPERTY =
-            "persist.sys.yasvara.trickystore.patch_override";
+    private static final class KeyboxMeta {
+        final String normalizedXml;
+        final String infoJson;
+        final String rkpManufacturer;
+        final String stamp;
 
-    private static final String[] NATIVE_PIF_KEYS = {
-        "manufacturer", "brand", "model", "device", "name",
-        "fingerprint", "release", "build_id", "security_patch", "first_api_level",
-        "build_type", "build_tags", "api_level", "os_version",
-        "incremental", "flavor", "description"
-    };
-
-    private boolean mBootDigestStarted;
+        KeyboxMeta(String normalizedXml, String infoJson, String rkpManufacturer, String stamp) {
+            this.normalizedXml = normalizedXml;
+            this.infoJson = infoJson;
+            this.rkpManufacturer = rkpManufacturer;
+            this.stamp = stamp;
+        }
+    }
 
     private final Context mContext;
     private final Object mLock = new Object();
     private final YasvaraKeyboxStore mKeyboxStore = new YasvaraKeyboxStore();
-    private List<YasvaraKeyboxProvider.Keybox> mKeyboxes = new ArrayList<>();
+    private KeyboxMeta mKeyboxMeta;
+    private boolean mBootDigestStarted;
 
     public YasvaraAttestationService(Context context) {
         mContext = context;
         loadFromFile();
-        startPifSync();
-        Slog.i(TAG, "started, keyboxes=" + mKeyboxes.size());
+        startSync();
+        Slog.i(TAG, "started, keyboxInstalled=" + (mKeyboxMeta != null));
     }
 
-    // --- Single-source PIF: the active profile (Settings.Secure) is the only input; it
-    // is fanned out to persist.sys.yasvara.pif.* — read by the native libc hook, the Java
-    // spoof and keystore2 alike — so the attestation and native reads never drift. ---
-
-    private void startPifSync() {
-        // This service is registered from startBootstrapServices, before
-        // ActivityManagerService and the SettingsProvider exist. A direct
-        // Settings.Secure read here throws an NPE inside acquireProvider and
-        // leaves both pif.json and the native staging empty. Defer to the main
-        // looper and retry until the provider is reachable.
+    private void startSync() {
         final Handler handler = new Handler(Looper.getMainLooper());
         handler.post(new Runnable() {
             @Override
@@ -139,70 +93,73 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
                 }
                 syncControl();
                 try {
-                    final Uri pifConfigUri = Settings.Secure.getUriFor(PIF_CONFIG_KEY);
-                    final Uri pifEnabledUri = Settings.Secure.getUriFor(PIF_ENABLED_KEY);
+                    final Uri pifConfigUri = Settings.Secure.getUriFor(
+                            YasvaraIntegrityContract.SECURE_PIF_CONFIG);
+                    final Uri pifEnabledUri = Settings.Secure.getUriFor(
+                            YasvaraIntegrityContract.SECURE_PIF_ENABLED);
                     ContentObserver observer = new ContentObserver(handler) {
                         @Override
                         public void onChange(boolean selfChange, Uri uri) {
-                            if ( pifConfigUri.equals(uri) || pifEnabledUri.equals(uri)) {
-                                syncPif();
-                                restartIntegrityProcesses(true);
+                            if (pifConfigUri.equals(uri) || pifEnabledUri.equals(uri)) {
+                                if (syncPif()) {
+                                    bumpPurgeGen();
+                                    restartIntegrityProcesses(true);
+                                }
                             } else {
                                 syncControl();
+                                bumpPurgeGen();
                                 restartIntegrityProcesses(false);
                             }
                         }
                     };
                     for (String key : new String[] {
-                            PIF_CONFIG_KEY, PIF_ENABLED_KEY, PATCH_OVERRIDE_KEY,
-                            YasvaraTrickyStore.KEY_ENABLED, YasvaraTrickyStore.KEY_TARGETS}) {
+                            YasvaraIntegrityContract.SECURE_PIF_CONFIG,
+                            YasvaraIntegrityContract.SECURE_PIF_ENABLED,
+                            YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE,
+                            YasvaraIntegrityContract.SECURE_TRICKY_ENABLED,
+                            YasvaraIntegrityContract.SECURE_TRICKY_TARGETS}) {
                         mContext.getContentResolver().registerContentObserver(
                                 Settings.Secure.getUriFor(key), false, observer);
                     }
-                    Slog.i(TAG, "PIF sync ready");
+                    Slog.i(TAG, "integrity sync ready");
                 } catch (Throwable t) {
-                    Slog.w(TAG, "PIF observer registration failed", t);
+                    Slog.w(TAG, "observer registration failed", t);
                     handler.postDelayed(this, 1000);
                 }
             }
         });
     }
 
-    /**
-     * Publishes the master switch and the effective target list for keystore2, derived from
-     * the same settings the Java hooks read. The switch is a property; the list is a file next
-     * to the keybox so a restart of either side cannot leave them disagreeing.
-     */
     private void syncControl() {
         try {
             boolean enabled = YasvaraTrickyStore.isEnabled(mContext);
-            SystemProperties.set(NATIVE_ENABLED_PROPERTY, enabled ? "1" : "0");
+            SystemProperties.set(YasvaraIntegrityContract.PROP_TRICKY_ENABLED, enabled ? "1" : "0");
 
             String rawOverride = Settings.Secure.getString(
-                    mContext.getContentResolver(), PATCH_OVERRIDE_KEY);
+                    mContext.getContentResolver(),
+                    YasvaraIntegrityContract.SECURE_TRICKY_PATCH_OVERRIDE);
             String trimmedOverride = rawOverride != null ? rawOverride.trim() : "";
-            String globalPatchOverride = "";
-            if (!trimmedOverride.isEmpty()) {
-                try {
-                    globalPatchOverride = new JSONObject(trimmedOverride).optString("*", "").trim();
-                } catch (JSONException ignored) {
-                }
-            }
-            SystemProperties.set(NATIVE_PATCH_OVERRIDE_PROPERTY, globalPatchOverride);
+            String globalPatchOverride = trimmedOverride.isEmpty()
+                    ? ""
+                    : nonNull(YasvaraIntegrityNative.nativeGlobalPatchOverride(trimmedOverride));
+            SystemProperties.set(
+                    YasvaraIntegrityContract.PROP_PATCH_OVERRIDE, globalPatchOverride);
 
             StringBuilder targets = new StringBuilder();
             for (String pkg : YasvaraTrickyStore.effectiveTargets(mContext)) {
                 targets.append(pkg).append('\n');
             }
-            List<YasvaraKeyboxProvider.Keybox> keyboxes;
+            KeyboxMeta meta;
             synchronized (mLock) {
-                mKeyboxStore.publishConfig("targets", targets.toString());
-                mKeyboxStore.publishConfig("patch_override", trimmedOverride);
-                keyboxes = new ArrayList<>(mKeyboxes);
+                mKeyboxStore.publishConfig(
+                        YasvaraIntegrityContract.TARGETS_FILENAME, targets.toString());
+                mKeyboxStore.publishConfig(
+                        YasvaraIntegrityContract.PATCH_OVERRIDE_FILENAME, trimmedOverride);
+                meta = mKeyboxMeta;
             }
-            updateRkpManufacturer(keyboxes, true);
+            updateRkpManufacturer(meta != null ? meta.rkpManufacturer : "", true);
         } catch (Throwable t) {
-            Slog.w(TAG, "syncControl failed; keystore2 keeps its previous target list", t);
+            Slog.w(TAG, "syncControl failed; keystore2 keeps its previous control state", t);
         }
     }
 
@@ -210,10 +167,12 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         try {
             if (!AKAR_MANAGED_FEATURES_FILE.isFile()) return false;
             String text = new String(
-                    java.nio.file.Files.readAllBytes(AKAR_MANAGED_FEATURES_FILE.toPath()),
+                    Files.readAllBytes(AKAR_MANAGED_FEATURES_FILE.toPath()),
                     StandardCharsets.UTF_8);
             for (String token : text.trim().split(",")) {
-                if ("play_integrity".equals(token.trim())) return true;
+                if (YasvaraIntegrityContract.AKAR_FEATURE_PLAY_INTEGRITY.equals(token.trim())) {
+                    return true;
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -223,23 +182,42 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
     private boolean syncPif() {
         try {
             int pifEnabled = Settings.Secure.getInt(
-                    mContext.getContentResolver(), PIF_ENABLED_KEY, 0);
+                    mContext.getContentResolver(),
+                    YasvaraIntegrityContract.SECURE_PIF_ENABLED, 0);
             if (pifEnabled != 1 || isExternalPlayIntegrityModuleActive()) {
-                SystemProperties.set(NATIVE_PIF_ENABLED_PROPERTY, "0");
+                SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
                 clearNativePif();
-                Slog.i(TAG, "PIF disabled or yielded to external module: native staging cleared");
+                Slog.i(TAG, "PIF disabled or yielded to Akar module: native staging cleared");
                 return true;
             }
-            Map<String, String> pif = YasvaraSpoofEngine.getPifConfig(mContext);
-            if (pif == null || pif.isEmpty()) {
-                SystemProperties.set(NATIVE_PIF_ENABLED_PROPERTY, "0");
+            String rawPif = Settings.Secure.getString(
+                    mContext.getContentResolver(), YasvaraIntegrityContract.SECURE_PIF_CONFIG);
+            if (rawPif == null || rawPif.trim().isEmpty()) {
+                rawPif = readFallbackPif();
+            }
+            if (rawPif == null || rawPif.trim().isEmpty()) {
+                SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
                 clearNativePif();
-                Slog.w(TAG, "Empty or invalid PIF config; cleared profile staging");
+                Slog.w(TAG, "Empty PIF config; cleared profile staging");
                 return true;
             }
-            stageNativePif(pif);
-            SystemProperties.set(NATIVE_PIF_ENABLED_PROPERTY, "1");
-            Slog.i(TAG, "PIF synced: native staging updated");
+            String platformRelease = SystemProperties.get("ro.build.version.release",
+                    Build.VERSION.RELEASE != null ? Build.VERSION.RELEASE : "17");
+            String[] flatPairs = YasvaraIntegrityNative.nativeNormalizePif(rawPif, platformRelease);
+            if (flatPairs == null || flatPairs.length == 0 || (flatPairs.length & 1) != 0) {
+                SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
+                clearNativePif();
+                Slog.w(TAG, "Invalid PIF config; cleared profile staging");
+                return true;
+            }
+            if (!stageNativePif(flatPairs)) {
+                SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0");
+                clearNativePif();
+                Slog.w(TAG, "Partial PIF staging failure; reverted pif.enabled=0");
+                return false;
+            }
+            SystemProperties.set(YasvaraIntegrityContract.PROP_PIF_ENABLED, "1");
+            Slog.i(TAG, "PIF synced via Rust normalizer");
             return true;
         } catch (Throwable t) {
             Slog.w(TAG, "syncPif failed", t);
@@ -250,7 +228,7 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
     private void startBootDigestPublisher() {
         if (!mBootDigestStarted) {
             try {
-                YasvaraBootDigestPublisher.start(mContext);
+                YasvaraBootDigestPublisher.start(mContext, this::onBootDigestPublished);
                 mBootDigestStarted = true;
             } catch (Throwable t) {
                 Slog.w(TAG, "startBootDigestPublisher deferred", t);
@@ -258,172 +236,191 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
     }
 
-    private void stageNativePif(Map<String, String> pif) {
-        String fp = pif.getOrDefault("FINGERPRINT", "");
-        String product = pif.getOrDefault("PRODUCT", "");
-        String release = pif.getOrDefault("RELEASE", "");
-        String id = pif.getOrDefault("ID", "");
-        String incremental = pif.getOrDefault("INCREMENTAL", "");
-        String type = pif.getOrDefault("TYPE", "");
-        String tags = pif.getOrDefault("TAGS", "");
-
-        setNative("manufacturer", pif.getOrDefault("MANUFACTURER", ""));
-        setNative("brand", pif.getOrDefault("BRAND", ""));
-        setNative("model", pif.getOrDefault("MODEL", ""));
-        setNative("device", pif.getOrDefault("DEVICE", ""));
-        setNative("name", product);
-        setNative("fingerprint", (fp != null && fp.length() < 92) ? fp : "");
-        setNative("release", release);
-        setNative("build_id", id);
-        setNative("security_patch", pif.getOrDefault("SECURITY_PATCH", ""));
-        setNative("first_api_level", pif.getOrDefault("DEVICE_INITIAL_SDK_INT", ""));
-        setNative("build_type", type);
-        setNative("build_tags", tags);
-        // Never copy DEVICE_INITIAL_SDK_INT into api_level: Android 15+ ro.board.api_level /
-        // ro.vendor.api_level / ro.llndk.api_level use YYYYMM (e.g. 202404), not SDK ints.
-        setNative("api_level", YasvaraSpoofEngine.resolveBoardApiLevel(pif));
-        int osVer = YasvaraSpoofEngine.resolvePifOsVersion(pif);
-        setNative("os_version", osVer >= 0 ? String.valueOf(osVer) : "");
-        setNative("incremental", incremental);
-        if (!product.isEmpty() && !type.isEmpty()) {
-            String flavor = product + "-" + type;
-            setNative("flavor", flavor);
-            setNative("description",
-                    flavor + " " + release + " " + id + " " + incremental + " " + tags);
-        } else {
-            setNative("flavor", "");
-            setNative("description", "");
+    /**
+     * Closes the early-boot race where GMS or Play Store launches before `ro.yasvara.boot.digest`
+     * is published (receiving an unpatched hardware chain). Zero overhead when no collector has
+     * started yet; otherwise bumps `purge_gen` and restarts the early-started collector processes.
+     */
+    private void onBootDigestPublished() {
+        if (!hasRunningIntegrityCollector()) {
+            return;
         }
+        bumpPurgeGen();
+        int killed = restartIntegrityProcesses(false);
+        Slog.i(TAG, "Restarted " + killed + " early-started integrity collector(s) after boot digest");
+    }
+
+    private boolean hasRunningIntegrityCollector() {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            ActivityManager am = mContext.getSystemService(ActivityManager.class);
+            if (am == null) return false;
+            List<ActivityManager.RunningAppProcessInfo> procs = am.getRunningAppProcesses();
+            if (procs == null) return false;
+            for (ActivityManager.RunningAppProcessInfo proc : procs) {
+                if (proc == null || proc.processName == null) continue;
+                String name = proc.processName;
+                if (YasvaraIntegrityContract.PROC_GMS_UNSTABLE.equals(name)
+                        || YasvaraIntegrityContract.PKG_VENDING.equals(name)
+                        || YasvaraIntegrityContract.PKG_GMS.equals(name)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+        return false;
+    }
+
+    private boolean stageNativePif(String[] flatPairs) {
+        boolean allOk = true;
+        for (int i = 0; i + 1 < flatPairs.length; i += 2) {
+            if (!setNative(flatPairs[i], flatPairs[i + 1])) {
+                allOk = false;
+            }
+        }
+        return allOk;
     }
 
     private void clearNativePif() {
-        for (String k : NATIVE_PIF_KEYS) {
+        for (String k : YasvaraIntegrityContract.NATIVE_PIF_STAGING_KEYS) {
             setNative(k, "");
         }
     }
 
-    private void setNative(String key, String value) {
+    private boolean setNative(String key, String value) {
         try {
-            SystemProperties.set(NATIVE_PIF_PREFIX + key, value == null ? "" : value);
+            SystemProperties.set(
+                    YasvaraIntegrityContract.PROP_PIF_PREFIX + key, value == null ? "" : value);
+            return true;
         } catch (Throwable t) {
             Slog.w(TAG, "setNative " + key + " failed", t);
+            return false;
+        }
+    }
+
+    private static String readFallbackPif() {
+        try {
+            if (!PIF_FALLBACK_FILE.isFile()) return null;
+            return new String(Files.readAllBytes(PIF_FALLBACK_FILE.toPath()),
+                    StandardCharsets.UTF_8);
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
     @Override
-    public String protectChain(String pkg, int uid, String base64Chain) {
-        try {
-            if (base64Chain == null || base64Chain.length() > MAX_CHAIN_BYTES * 2) {
-                return base64Chain;
-            }
-            // The caller proves which of its packages is asking: pkg must belong to the
-            // calling uid, otherwise one target in a shared uid could rewrite neighbours.
-            if (!ownsPackage(Binder.getCallingUid(), pkg)) return base64Chain;
-            if (!YasvaraTrickyStore.isEnabled(mContext)) return base64Chain;
-            // Intent gate lives in the shared entry point so both paths agree.
-            if (!YasvaraTrickyStore.isTarget(mContext, pkg)) return base64Chain;
-
-            Certificate[] chain = decode(base64Chain);
-            if (chain == null) return base64Chain;
-
-            List<YasvaraKeyboxProvider.Keybox> keyboxes;
-            synchronized (mLock) {
-                keyboxes = new ArrayList<>(mKeyboxes);
-            }
-            Certificate[] out = YasvaraLadder.serveWithKeyboxes(mContext, pkg, chain, keyboxes);
-            if (out == chain) return base64Chain;
-            String encoded = encode(out);
-            return encoded != null ? encoded : base64Chain;
-        } catch (Throwable t) {
-            Log.w(TAG, "protectChain failed", t);
-            return base64Chain;
+    public String getStatus() {
+        final String digest = SystemProperties.get(YasvaraIntegrityContract.PROP_BOOT_DIGEST, "");
+        final String bootSource = SystemProperties.get(YasvaraIntegrityContract.PROP_BOOT_SOURCE, "");
+        final boolean pifEnabled = "1".equals(
+                SystemProperties.get(YasvaraIntegrityContract.PROP_PIF_ENABLED, "0"));
+        final boolean trickyEnabled = "1".equals(
+                SystemProperties.get(YasvaraIntegrityContract.PROP_TRICKY_ENABLED, "1"));
+        final boolean keyboxLoaded;
+        final String rkpManufacturer;
+        synchronized (mLock) {
+            keyboxLoaded = mKeyboxMeta != null;
+            rkpManufacturer = mKeyboxMeta != null ? nonNull(mKeyboxMeta.rkpManufacturer) : "";
         }
-    }
-
-    @Override
-    public String synthesizeChain(String pkg, int uid, byte[] requestData) {
+        final int purgeGen = readPurgeGen();
         try {
-            if (requestData == null || requestData.length == 0 || requestData.length > MAX_CHAIN_BYTES * 2) {
-                return "";
-            }
-            if (!ownsPackage(Binder.getCallingUid(), pkg)) return "";
-            if (!YasvaraTrickyStore.isEnabled(mContext)) return "";
-            if (!YasvaraTrickyStore.isTarget(mContext, pkg)) return "";
-
-            List<YasvaraKeyboxProvider.Keybox> keyboxes;
-            synchronized (mLock) {
-                keyboxes = new ArrayList<>(mKeyboxes);
-            }
-            if (keyboxes.isEmpty()) return "";
-
-            Certificate[] chain = YasvaraKeySynthesizer.generateChainFromBytes(
-                    mContext, pkg, uid, requestData, keyboxes);
-            if (chain == null || chain.length == 0) return "";
-            String encoded = encode(chain);
-            return encoded != null ? encoded : "";
-        } catch (Throwable t) {
-            Log.w(TAG, "synthesizeChain failed", t);
+            return new JSONObject()
+                    .put("bootDigestReady", !digest.isEmpty())
+                    .put("bootSource", bootSource)
+                    .put("keyboxLoaded", keyboxLoaded)
+                    .put("rkpManufacturer", rkpManufacturer)
+                    .put("pifEnabled", pifEnabled)
+                    .put("trickystoreEnabled", trickyEnabled)
+                    .put("purgeGen", purgeGen)
+                    .toString();
+        } catch (JSONException e) {
             return "";
         }
     }
 
     @Override
-    public String getRung(String pkg) {
+    public int purgeIntegrityCache() {
+        enforceWrite();
+        bumpPurgeGen();
+        int killed = restartIntegrityProcesses(true);
+        Slog.i(TAG, "purgeIntegrityCache bumped gen and restarted " + killed + " process(es)");
+        return killed;
+    }
+
+    private int readPurgeGen() {
+        final long token = Binder.clearCallingIdentity();
         try {
-            if (pkg == null) return "";
-            String raw = Settings.Secure.getString(mContext.getContentResolver(), RUNG_KEY);
-            if (raw == null || raw.isEmpty()) return "";
-            JSONObject entry = new JSONObject(raw).optJSONObject(pkg);
-            return entry != null ? entry.toString() : "";
+            return Settings.Secure.getInt(
+                    mContext.getContentResolver(),
+                    YasvaraIntegrityContract.SECURE_INTEGRITY_PURGE_GEN, 0);
+        } catch (Throwable ignored) {
+            return 0;
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    private void bumpPurgeGen() {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            int next = Settings.Secure.getInt(
+                    mContext.getContentResolver(),
+                    YasvaraIntegrityContract.SECURE_INTEGRITY_PURGE_GEN, 0) + 1;
+            Settings.Secure.putInt(
+                    mContext.getContentResolver(),
+                    YasvaraIntegrityContract.SECURE_INTEGRITY_PURGE_GEN, next);
         } catch (Throwable t) {
-            return "";
+            Slog.w(TAG, "bumpPurgeGen failed", t);
+        } finally {
+            Binder.restoreCallingIdentity(token);
         }
     }
 
     @Override
     public String getKeyboxInfo() {
+        synchronized (mLock) {
+            return mKeyboxMeta != null ? mKeyboxMeta.infoJson : "";
+        }
+    }
+
+    @Override
+    public String inspectKeybox(String rawXml, boolean requirePrivateKey) {
+        enforceWrite();
+        String raw = rawXml == null ? "" : rawXml;
+        String json = YasvaraIntegrityNative.nativeInspectKeybox(raw, requirePrivateKey);
+        if (json == null || json.isEmpty()) {
+            return "{\"valid\":false,\"error\":"
+                    + YasvaraIntegrityContract.KEYBOX_ERR_INVALID_KEYBOX + "}";
+        }
+        // Strip normalizedXml (which carries private keys) before returning over Binder.
         try {
-            synchronized (mLock) {
-                if (mKeyboxes.isEmpty()) return "";
-                YasvaraKeyboxProvider.Keybox kb = mKeyboxes.get(0);
-                X509Certificate leaf = kb.leaf();
-                JSONObject o = new JSONObject();
-                o.put("algorithm", kb.algorithm);
-                o.put("serialHex", leaf.getSerialNumber().toString(16));
-                o.put("issuer", leaf.getIssuerX500Principal().getName());
-                o.put("notAfter", leaf.getNotAfter().getTime());
-                o.put("chainLength", kb.chain.size());
-                o.put("hasPrivateKey", kb.hasPrivateKey());
-                JSONArray algos = new JSONArray();
-                for (YasvaraKeyboxProvider.Keybox k : mKeyboxes) {
-                    algos.put(k.algorithm);
-                }
-                o.put("algorithms", algos);
-                o.put("keyCount", mKeyboxes.size());
-                o.put("rkpManufacturer", YasvaraKeyboxProvider.rkpManufacturer(mKeyboxes));
-                return o.toString();
-            }
-        } catch (Throwable t) {
-            return "";
+            JSONObject o = new JSONObject(json);
+            o.remove("normalizedXml");
+            return o.toString();
+        } catch (JSONException e) {
+            return "{\"valid\":false,\"error\":"
+                    + YasvaraIntegrityContract.KEYBOX_ERR_INVALID_KEYBOX + "}";
         }
     }
 
     @Override
     public void setKeybox(String xml) {
         enforceWrite();
-        String normalized = YasvaraKeyboxStore.normalize(xml);
-        List<YasvaraKeyboxProvider.Keybox> keyboxes = parseKeyboxes(normalized);
+        KeyboxMeta meta = inspectKeyboxStrict(xml);
         synchronized (mLock) {
             try {
-                mKeyboxStore.install(normalized, () -> mKeyboxes = keyboxes);
-                Slog.i(TAG, "keybox installed, entries=" + mKeyboxes.size());
+                mKeyboxStore.install(meta.normalizedXml, () -> mKeyboxMeta = meta);
+                Slog.i(TAG, "keybox installed via Rust validator");
             } catch (IOException e) {
                 Slog.e(TAG, "setKeybox failed", e);
                 throw new IllegalStateException("keybox store failed: " + e.getMessage());
             }
         }
-        updateKeyboxStamp(keyboxes);
-        updateRkpManufacturer(keyboxes, true);
+        updateKeyboxStamp(meta.stamp);
+        updateRkpManufacturer(meta.rkpManufacturer, true);
+        bumpPurgeGen();
         restartIntegrityProcesses(true);
     }
 
@@ -432,34 +429,35 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         enforceWrite();
         synchronized (mLock) {
             try {
-                mKeyboxStore.clear(() -> mKeyboxes = new ArrayList<>());
+                mKeyboxStore.clear(() -> mKeyboxMeta = null);
                 Slog.i(TAG, "keybox cleared");
             } catch (IOException e) {
                 Slog.e(TAG, "clearKeybox failed", e);
                 throw new IllegalStateException("keybox clear failed: " + e.getMessage());
             }
         }
-        updateKeyboxStamp(null);
-        updateRkpManufacturer(null, true);
+        updateKeyboxStamp("");
+        updateRkpManufacturer("", true);
+        bumpPurgeGen();
         restartIntegrityProcesses(true);
     }
 
-    private void updateRkpManufacturer(
-            List<YasvaraKeyboxProvider.Keybox> keyboxes, boolean writeSettings) {
-        String mfg = YasvaraKeyboxProvider.rkpManufacturer(keyboxes);
+    private void updateRkpManufacturer(String mfg, boolean writeSettings) {
+        String val = mfg != null ? mfg : "";
         try {
-            SystemProperties.set(NATIVE_RKP_MANUFACTURER_PROPERTY, mfg);
+            SystemProperties.set(YasvaraIntegrityContract.PROP_RKP_MANUFACTURER, val);
         } catch (Throwable t) {
-            Slog.w(TAG, "set " + NATIVE_RKP_MANUFACTURER_PROPERTY + " failed", t);
+            Slog.w(TAG, "set " + YasvaraIntegrityContract.PROP_RKP_MANUFACTURER + " failed", t);
         }
         if (!writeSettings) return;
         final long token = Binder.clearCallingIdentity();
         try {
             String current = Settings.Secure.getString(
-                    mContext.getContentResolver(), RKP_MANUFACTURER_KEY);
-            if (!mfg.equals(current != null ? current : "")) {
+                    mContext.getContentResolver(), YasvaraIntegrityContract.SECURE_RKP_MANUFACTURER);
+            if (!val.equals(current != null ? current : "")) {
                 Settings.Secure.putString(
-                        mContext.getContentResolver(), RKP_MANUFACTURER_KEY, mfg);
+                        mContext.getContentResolver(),
+                        YasvaraIntegrityContract.SECURE_RKP_MANUFACTURER, val);
             }
         } catch (Throwable t) {
             Slog.w(TAG, "updateRkpManufacturer failed", t);
@@ -468,37 +466,16 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
     }
 
-    private void updateKeyboxStamp(List<YasvaraKeyboxProvider.Keybox> keyboxes) {
+    private void updateKeyboxStamp(String stamp) {
+        String val = stamp != null ? stamp : "";
         final long token = Binder.clearCallingIdentity();
         try {
-            String stamp = "";
-            if (keyboxes != null && !keyboxes.isEmpty()) {
-                try {
-                    MessageDigest md = MessageDigest.getInstance("SHA-256");
-                    for (YasvaraKeyboxProvider.Keybox kb : keyboxes) {
-                        if (kb.algorithm != null) {
-                            md.update(kb.algorithm.getBytes(StandardCharsets.UTF_8));
-                        }
-                        if (kb.chain != null) {
-                            for (X509Certificate cert : kb.chain) {
-                                md.update(cert.getEncoded());
-                            }
-                        }
-                    }
-                    stamp = Base64.encodeToString(md.digest(), Base64.NO_WRAP)
-                            + ":" + keyboxes.size();
-                } catch (Throwable ignored) {
-                    X509Certificate leaf = keyboxes.get(0).leaf();
-                    stamp = (leaf != null && leaf.getSerialNumber() != null)
-                            ? leaf.getSerialNumber().toString(16) + ":" + keyboxes.size()
-                            : String.valueOf(keyboxes.size());
-                }
-            }
             String current = Settings.Secure.getString(
-                    mContext.getContentResolver(), KEYBOX_STAMP_KEY);
-            if (!stamp.equals(current != null ? current : "")) {
+                    mContext.getContentResolver(), YasvaraIntegrityContract.SECURE_KEYBOX_STAMP);
+            if (!val.equals(current != null ? current : "")) {
                 Settings.Secure.putString(
-                        mContext.getContentResolver(), KEYBOX_STAMP_KEY, stamp);
+                        mContext.getContentResolver(),
+                        YasvaraIntegrityContract.SECURE_KEYBOX_STAMP, val);
             }
         } catch (Throwable t) {
             Slog.w(TAG, "updateKeyboxStamp failed", t);
@@ -507,31 +484,19 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
     }
 
-    /**
-     * Kills running GMS / Play Store processes cleanly via SIGKILL without calling
-     * forceStopPackage (which would set FLAG_STOPPED and wipe GMS alarms/jobs/FCM).
-     *
-     * @param fullGms true when PIF or keybox changed (kills all GMS/GSF processes so
-     *                Build.* fields and compliance/DroidGuard caches are cleared);
-     *                false when only target/override rules changed.
-     */
-    private void restartIntegrityProcesses(boolean fullGms) {
+    private int restartIntegrityProcesses(boolean fullGms) {
         if (fullGms) {
-            killPackageProcesses(List.of(YasvaraSpoofEngine.PKG_VENDING,
-                    YasvaraSpoofEngine.PKG_GMS, YasvaraSpoofEngine.PKG_GSF), null, -1);
-        } else {
-            killPackageProcesses(List.of(YasvaraSpoofEngine.PKG_VENDING), null, -1);
-            killPackageProcesses(List.of(YasvaraSpoofEngine.PKG_GMS),
-                    YasvaraSpoofEngine.PKG_GMS + ".unstable", -1);
+            return killPackageProcesses(List.of(
+                    YasvaraIntegrityContract.PKG_VENDING,
+                    YasvaraIntegrityContract.PKG_GMS,
+                    YasvaraIntegrityContract.PKG_GSF), null, -1);
         }
+        int killed = killPackageProcesses(List.of(YasvaraIntegrityContract.PKG_VENDING), null, -1);
+        killed += killPackageProcesses(List.of(YasvaraIntegrityContract.PKG_GMS),
+                YasvaraIntegrityContract.PROC_GMS_UNSTABLE, -1);
+        return killed;
     }
 
-    /**
-     * Laras' "Restart" / per-app apply. Laras runs as its own app uid and can neither
-     * signal another app's pids nor reach bound/foreground processes through
-     * killBackgroundProcesses (and "com.google.android.gms.unstable" is a process name, not
-     * a package), so the kill happens here, where system_server holds CAP_KILL.
-     */
     @Override
     public int restartPackages(String[] packages) {
         enforceWrite();
@@ -550,19 +515,6 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         return killPackageProcesses(targets, null, Binder.getCallingPid());
     }
 
-    /**
-     * SIGKILLs every running process owned by {@code packages}, across users. A process is
-     * owned when its name is pkg, pkg:* or pkg.* (or it lists pkg in its package list) and
-     * its uid has the package's app id, so shared names such as com.google.process.gapps are
-     * caught while look-alike names from other uids are not. Only app uids are touched; the
-     * processes come back on demand and spoof state is re-read (and the DroidGuard caches
-     * re-stamped by YasvaraSpoofEngine) at their next start. No force-stop: FLAG_STOPPED,
-     * alarms, jobs and FCM registrations are left alone.
-     *
-     * @param onlyProcess when non-null, only the process with exactly this name is killed.
-     * @param skipPid     a pid never to kill (the binder caller), or -1.
-     * @return the number of processes signalled.
-     */
     private int killPackageProcesses(Collection<String> packages, String onlyProcess,
             int skipPid) {
         int killed = 0;
@@ -582,8 +534,6 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
                         Slog.w(TAG, "not restarting non-app package " + pkg);
                     }
                 } catch (PackageManager.NameNotFoundException e) {
-                    // May be a package installed only for a secondary user or a process name
-                    // such as com.google.android.gms.unstable; fall back to process matching.
                     unmatchedPkgs.add(pkg);
                 }
             }
@@ -621,8 +571,6 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
                 if (shouldKill) {
                     Process.killProcess(proc.pid);
                     killed++;
-                    Slog.i(TAG, "Killed process " + proc.processName + " (pid=" + proc.pid
-                            + ", uid=" + proc.uid + ")");
                 }
             }
             if (onlyProcess == null) {
@@ -658,84 +606,53 @@ public class YasvaraAttestationService extends IYasvaraAttestation.Stub {
         }
     }
 
-    private boolean ownsPackage(int uid, String pkg) {
-        try {
-            if (pkg == null || pkg.isEmpty()) return false;
-            String[] pkgs = mContext.getPackageManager().getPackagesForUid(uid);
-            if (pkgs == null) return false;
-            for (String p : pkgs) {
-                if (pkg.equals(p)) return true;
-            }
-            return false;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
     private void loadFromFile() {
-        List<YasvaraKeyboxProvider.Keybox> loaded = null;
+        KeyboxMeta loaded = null;
         synchronized (mLock) {
             try {
-                mKeyboxStore.load(YasvaraAttestationService::parseKeyboxes,
-                        keyboxes -> mKeyboxes = keyboxes != null ? keyboxes : new ArrayList<>());
-                loaded = new ArrayList<>(mKeyboxes);
+                mKeyboxStore.load(YasvaraAttestationService::inspectKeyboxStrict,
+                        meta -> mKeyboxMeta = meta);
+                loaded = mKeyboxMeta;
             } catch (IOException | IllegalArgumentException e) {
-                // A failed migration must not fall back to a Java-only legacy credential.
                 Slog.e(TAG, "loadFromFile failed; check canonical directory setup and keybox", e);
             }
         }
         if (loaded != null) {
-            updateRkpManufacturer(loaded, false);
+            updateRkpManufacturer(loaded.rkpManufacturer, false);
         }
     }
 
-    private static List<YasvaraKeyboxProvider.Keybox> parseKeyboxes(String xml) {
-        YasvaraKeyboxProvider.ParseResult result = YasvaraKeyboxProvider.parse(xml);
-        if (!result.isValid() || result.keyboxes.stream().noneMatch(k -> k.hasPrivateKey())) {
-            throw new IllegalArgumentException("keybox has no usable private key");
+    private static KeyboxMeta inspectKeyboxStrict(String rawXml) {
+        if (rawXml == null || rawXml.isEmpty()) {
+            throw new IllegalArgumentException("keybox is empty");
         }
-        return new ArrayList<>(result.keyboxes);
-    }
-
-    private static Certificate[] decode(String joined) {
+        String json = YasvaraIntegrityNative.nativeInspectKeybox(rawXml, true);
+        if (json == null || json.isEmpty()) {
+            throw new IllegalArgumentException("keybox validation failed");
+        }
         try {
-            String[] parts = joined.split("\n");
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            List<Certificate> out = new ArrayList<>(parts.length);
-            for (String p : parts) {
-                String t = p.trim();
-                if (t.isEmpty()) continue;
-                byte[] der = Base64.decode(t, Base64.DEFAULT);
-                if (der.length > MAX_CHAIN_BYTES) return null;
-                out.add(cf.generateCertificate(new ByteArrayInputStream(der)));
+            JSONObject o = new JSONObject(json);
+            if (!o.optBoolean("valid", false)) {
+                throw new IllegalArgumentException(
+                        "keybox rejected by Rust validator (code=" + o.optInt("error", -1) + ")");
             }
-            return out.isEmpty() ? null : out.toArray(new Certificate[0]);
-        } catch (Throwable t) {
-            return null;
+            return new KeyboxMeta(
+                    o.optString("normalizedXml", ""),
+                    o.optString("infoJson", ""),
+                    o.optString("rkpManufacturer", ""),
+                    o.optString("stamp", ""));
+        } catch (JSONException e) {
+            throw new IllegalArgumentException("keybox metadata malformed", e);
         }
     }
 
-    private static String encode(Certificate[] chain) {
-        try {
-            StringBuilder sb = new StringBuilder();
-            int total = 0;
-            for (Certificate c : chain) {
-                byte[] der = c.getEncoded();
-                total += der.length;
-                if (total > MAX_CHAIN_BYTES) return null;
-                if (sb.length() > 0) sb.append('\n');
-                sb.append(Base64.encodeToString(der, Base64.NO_WRAP));
-            }
-            return sb.toString();
-        } catch (Throwable t) {
-            return null;
-        }
+    private static String nonNull(String s) {
+        return s == null ? "" : s;
     }
 
-    /** For tests and early-boot callers: is there a usable keybox right now? */
     boolean hasKeyboxesForTest() {
         synchronized (mLock) {
-            return !mKeyboxes.isEmpty();
+            return mKeyboxMeta != null;
         }
     }
 }

@@ -5,47 +5,51 @@
 package android.security.yasvara;
 
 /**
- * System-side attestation protection. Implemented by YasvaraAttestationService in
- * system_server; called from keystore hooks in target app processes and from Laras.
+ * System-side integrity & attestation control plane implemented by YasvaraAttestationService
+ * in system_server and backed by Rust (`libyasvara_integrity_jni`).
  *
- * <p>Chains travel as newline-joined base64 DER (leaf first), capped at 64 KiB each way.
- * The private key never crosses this interface in either direction.
+ * <p>All runtime certificate patching and `PURPOSE_ATTEST_KEY` handling run natively inside
+ * Rust `keystore2`; private keys never cross Binder or enter Settings.Secure.
  *
  * @hide
  */
 interface IYasvaraAttestation {
     /**
-     * Runs the ladder for pkg/uid and returns the chain the caller should use
-     * (rewritten or the input unchanged). The service verifies pkg belongs to the
-     * calling uid; mismatches return the input unchanged.
+     * Live runtime status JSON `{bootDigestReady, bootSource, keyboxLoaded, rkpManufacturer,
+     * pifEnabled, trickystoreEnabled, purgeGen}`. Zero disk I/O.
      */
-    String protectChain(String pkg, int uid, String base64Chain);
-
-    /** Last rung report for pkg as JSON {rung, at, reason}, or "" when none. */
-    String getRung(String pkg);
+    String getStatus();
 
     /** Installed keybox descriptor as JSON, or "" when none. */
     String getKeyboxInfo();
 
-    /** Installs a keybox from its XML. Requires yasvara.permission.WRITE_ATTESTATION. */
+    /**
+     * Validates a candidate keybox (raw XML or Base64 XML) using the exact same Rust/BoringSSL
+     * parser as `keystore2`. Requires yasvara.permission.WRITE_ATTESTATION.
+     *
+     * @return JSON `{valid, error, publicChainXml, rkpManufacturer, stamp, infoJson}`.
+     */
+    String inspectKeybox(String rawXml, boolean requirePrivateKey);
+
+    /** Installs a keybox from its XML or Base64 XML. Requires yasvara.permission.WRITE_ATTESTATION. */
     void setKeybox(String xml);
 
     /** Removes the installed keybox. Requires yasvara.permission.WRITE_ATTESTATION. */
     void clearKeybox();
 
     /**
-     * Synthesizes an attestation certificate chain for a newly generated key.
-     * Returns newline-joined base64 DER certificates (leaf first), or empty string on failure.
+     * Bumps the monotonic integrity cache purge generation and restarts GMS / Play Store / GSF
+     * so `YasvaraSpoofEngine` clears stale `dg.db`, `gmscompliance`, and `app_dg_cache` caches
+     * cleanly without wiping user accounts. Requires yasvara.permission.WRITE_ATTESTATION.
+     *
+     * @return number of processes restarted.
      */
-    String synthesizeChain(String pkg, int uid, in byte[] requestData);
+    int purgeIntegrityCache();
 
     /**
      * SIGKILLs every running process of the given packages (all users) from system_server,
-     * so spoof settings read at process start take effect on the next launch. Matches the
-     * package's own processes by name (pkg, pkg:*, pkg.*) or package list, uid-checked, so
-     * DroidGuard (com.google.android.gms.unstable), com.google.process.gapps and bound or
-     * foreground processes are included. Never force-stops (alarms, jobs and FCM survive).
-     * Only app uids are touched. Requires yasvara.permission.WRITE_ATTESTATION.
+     * so spoof settings read at process start take effect on the next launch.
+     * Requires yasvara.permission.WRITE_ATTESTATION.
      *
      * @return number of processes killed.
      */
